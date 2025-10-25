@@ -1,0 +1,53 @@
+[package]
+name = "youtube-music-player-rust"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A terminal-based music player that streams from YouTube"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# TUI framework
+ratatui = "0.25"
+crossterm = "0.27"
+
+# Audio playback
+rodio = "0.17"
+
+# HTTP client for API requests
+reqwest = { version = "0.11", features = ["json", "blocking", "cookies"] }
+
+# JSON serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# YouTube data extraction (we'll use yt-dlp via subprocess)
+# Alternative: rustube = "0.6" (pure Rust, but may be less feature-complete)
+
+# Logging (optional, useful for debugging)
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Directory paths (for config storage)
+dirs = "5.0"
+
+# Open URLs in browser
+open = "5.0"
+
+# OAuth 2.0 for YouTube authentication
+oauth2 = "4.4"
+
+# Time handling for token expiry
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

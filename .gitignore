@@ -1,0 +1,32 @@
+# Rust build artifacts
+/target
+Cargo.lock
+
+# Config directory with sensitive data (auth tokens, cookies)
+# Users will generate their own
+.config/
+auth.json
+cookies.txt
+
+# History/temp files
+.history/
+*.log
+debug.log
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment files (OAuth credentials)
+.env
+.env.local
+
+# Debug files
+*.pdb
+
+# OS files
+Thumbs.db
