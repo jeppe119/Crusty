@@ -9,7 +9,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
 };
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -28,6 +28,20 @@ enum AppMode {
     Searching,
     LoginPrompt,   // Show login screen
     AccountPicker, // Show list of browser accounts
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ViewMode {
+    Home,      // Showing My Mix | History
+    Search,    // Showing Search Results | History
+}
+
+#[derive(Debug, Clone)]
+struct MixPlaylist {
+    id: String,
+    title: String,
+    track_count: usize,
+    url: String,
 }
 
 pub struct MusicPlayerApp {
@@ -49,6 +63,15 @@ pub struct MusicPlayerApp {
     status_message: String,
     // Track pre-downloaded files by video_id
     downloaded_files: Arc<Mutex<HashMap<String, String>>>,
+    // Queue view expansion toggle
+    queue_expanded: bool,
+    // View tracking
+    current_view: ViewMode,
+    previous_view: ViewMode,
+    // My Mix
+    my_mix_playlists: Vec<MixPlaylist>,
+    my_mix_expanded: bool,
+    selected_mix_item: usize,
 }
 
 impl MusicPlayerApp {
@@ -77,9 +100,17 @@ impl MusicPlayerApp {
             AppMode::LoginPrompt
         };
 
+        // Load persisted history
+        let mut queue = Queue::new();
+        if let Ok(history) = Self::load_history() {
+            for track in history {
+                queue.add_to_history(track);
+            }
+        }
+
         MusicPlayerApp {
             player: AudioPlayer::new(),
-            queue: Queue::new(),
+            queue,
             extractor: YouTubeExtractor::new(),
             browser_auth,
             available_accounts: Vec::new(),
@@ -95,7 +126,50 @@ impl MusicPlayerApp {
             search_tx,
             status_message,
             downloaded_files: Arc::new(Mutex::new(HashMap::new())),
+            queue_expanded: false,
+            current_view: ViewMode::Home,
+            previous_view: ViewMode::Home,
+            my_mix_playlists: Vec::new(),
+            my_mix_expanded: false,
+            selected_mix_item: 0,
         }
+    }
+
+    fn load_history() -> Result<Vec<Track>, Box<dyn std::error::Error>> {
+        use std::fs;
+
+        let config_dir = dirs::config_dir()
+            .ok_or("Could not find config directory")?
+            .join("youtube-music-player");
+
+        let history_file = config_dir.join("history.json");
+
+        if !history_file.exists() {
+            return Ok(Vec::new());
+        }
+
+        let contents = fs::read_to_string(history_file)?;
+        let history: Vec<Track> = serde_json::from_str(&contents)?;
+
+        Ok(history)
+    }
+
+    fn save_history(&self) -> Result<(), Box<dyn std::error::Error>> {
+        use std::fs;
+
+        let config_dir = dirs::config_dir()
+            .ok_or("Could not find config directory")?
+            .join("youtube-music-player");
+
+        fs::create_dir_all(&config_dir)?;
+
+        let history_file = config_dir.join("history.json");
+        let history = self.queue.get_history();
+        let json = serde_json::to_string_pretty(history)?;
+
+        fs::write(history_file, json)?;
+
+        Ok(())
     }
 
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -104,6 +178,9 @@ impl MusicPlayerApp {
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+
+        // Fetch My Mix on startup (placeholder for now)
+        self.fetch_my_mix().await;
 
         loop {
             terminal.draw(|f| self.draw_ui(f))?;
@@ -129,13 +206,18 @@ impl MusicPlayerApp {
 
             if event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
-                    self.handle_input(key.code).await;
+                    self.handle_input(key).await;
                 }
             }
 
             if self.should_quit {
                 break;
             }
+        }
+
+        // Save history before quitting
+        if let Err(e) = self.save_history() {
+            eprintln!("Failed to save history: {}", e);
         }
 
         disable_raw_mode()?;
@@ -165,9 +247,9 @@ impl MusicPlayerApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
-                Constraint::Min(10),
-                Constraint::Length(5),
+                Constraint::Length(3),      // Header
+                Constraint::Min(10),        // Main area
+                Constraint::Length(8),      // Bottom bar (Queue + Player)
             ])
             .split(frame.size());
 
@@ -185,7 +267,7 @@ impl MusicPlayerApp {
                     } else {
                         String::new()
                     };
-                    format!("Controls: [/]Search [Enter]Add [n]Next [p]Prev [Space]Play/Pause [j/k]Navigate [↑/↓]Volume [q]Quit{}", account_info)
+                    format!("Controls: [/]Search [Enter]Add [n]Next [p]Prev [Space]Play/Pause [j/k]Navigate [Shift+↑/↓]Volume [t]ToggleQueue [d]Delete [q]Quit{}", account_info)
                 },
                 AppMode::LoginPrompt => "Login Required".to_string(),
                 AppMode::AccountPicker => "Select YouTube Account".to_string(),
@@ -195,13 +277,49 @@ impl MusicPlayerApp {
             .block(Block::default().borders(Borders::ALL).title("YouTube Music Player"));
         frame.render_widget(header, chunks[0]);
 
-        // Main area - split between search results and queue
-        let main_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[1]);
+        // Main area layout depends on queue expansion, my mix expansion, or view mode
+        if self.queue_expanded {
+            // Queue expanded: Queue takes full main area
+            self.draw_queue_expanded(frame, chunks[1]);
+        } else if self.my_mix_expanded {
+            // My Mix expanded: My Mix takes full main area
+            self.draw_my_mix_expanded(frame, chunks[1]);
+        } else if self.current_view == ViewMode::Search || matches!(self.mode, AppMode::Searching) {
+            // Search view: Search Results (left) | History (right)
+            let main_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(chunks[1]);
 
-        // Search results
+            self.draw_search_results(frame, main_chunks[0]);
+            self.draw_history(frame, main_chunks[1]);
+        } else {
+            // Home view (default): My Mix (left) | History (right)
+            let main_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(chunks[1]);
+
+            self.draw_my_mix(frame, main_chunks[0]);
+            self.draw_history(frame, main_chunks[1]);
+        }
+
+        // Bottom bar: Player (left) | Queue (right)
+        if !self.queue_expanded {
+            let bottom_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(chunks[2]);
+
+            self.draw_player_bar(frame, bottom_chunks[0]);
+            self.draw_queue_compact(frame, bottom_chunks[1]);
+        } else {
+            // When queue is expanded, just show player bar at bottom
+            self.draw_player_bar(frame, chunks[2]);
+        }
+    }
+
+    fn draw_search_results(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let results: Vec<ListItem> = self
             .search_results
             .iter()
@@ -220,9 +338,38 @@ impl MusicPlayerApp {
 
         let results_list = List::new(results)
             .block(Block::default().borders(Borders::ALL).title("Search Results"));
-        frame.render_widget(results_list, main_chunks[0]);
+        frame.render_widget(results_list, area);
+    }
 
-        // Queue
+    fn draw_queue_compact(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        // Show queue items in a compact horizontal scrolling view
+        let queue_list = self.queue.get_queue_list();
+        let queue_preview: String = if queue_list.is_empty() {
+            "Queue is empty - Add tracks by pressing Enter on search results".to_string()
+        } else {
+            let items: Vec<String> = queue_list
+                .iter()
+                .take(3)  // Show first 3 tracks
+                .enumerate()
+                .map(|(i, track)| {
+                    format!("{}. {} - {}", i + 1, track.title, track.uploader)
+                })
+                .collect();
+
+            let preview = items.join(" | ");
+            if queue_list.len() > 3 {
+                format!("{} ... (+{} more)", preview, queue_list.len() - 3)
+            } else {
+                preview
+            }
+        };
+
+        let queue_widget = Paragraph::new(queue_preview)
+            .block(Block::default().borders(Borders::ALL).title(format!("Queue ({} tracks) - Press 't' to expand for management", queue_list.len())));
+        frame.render_widget(queue_widget, area);
+    }
+
+    fn draw_queue_expanded(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let queue_items: Vec<ListItem> = self
             .queue
             .get_queue_list()
@@ -230,7 +377,7 @@ impl MusicPlayerApp {
             .enumerate()
             .map(|(i, track)| {
                 let duration = Self::format_time(track.duration as f64);
-                let content = format!("{} - {} [{}]", track.title, track.uploader, duration);
+                let content = format!("{}. {} - {} [{}]", i + 1, track.title, track.uploader, duration);
                 let style = if i == self.selected_queue_item {
                     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
                 } else {
@@ -241,10 +388,76 @@ impl MusicPlayerApp {
             .collect();
 
         let queue_list = List::new(queue_items)
-            .block(Block::default().borders(Borders::ALL).title("Queue"));
-        frame.render_widget(queue_list, main_chunks[1]);
+            .block(Block::default().borders(Borders::ALL).title(format!("Queue (Expanded) - {} tracks | [j/k] Navigate | [d] Delete | [t] Collapse", self.queue.get_queue_list().len())));
+        frame.render_widget(queue_list, area);
+    }
 
-        // Player info
+    fn draw_history(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        let queue_history = self.queue.get_history();
+        let history_items: Vec<ListItem> = queue_history
+            .iter()
+            .rev()  // Show most recent first
+            .map(|track| {
+                let duration = Self::format_time(track.duration as f64);
+                let content = format!("{} - {} [{}]", track.title, track.uploader, duration);
+                ListItem::new(content).style(Style::default().fg(Color::DarkGray))
+            })
+            .collect();
+
+        let history_list = List::new(history_items)
+            .block(Block::default().borders(Borders::ALL).title(format!("History ({} played)", queue_history.len())));
+        frame.render_widget(history_list, area);
+    }
+
+    fn draw_my_mix(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        let mix_items: Vec<ListItem> = if self.my_mix_playlists.is_empty() {
+            vec![
+                ListItem::new("Loading My Mix...").style(Style::default().fg(Color::Yellow)),
+                ListItem::new(""),
+                ListItem::new("Fetching your personalized playlists from YouTube Music..."),
+            ]
+        } else {
+            self.my_mix_playlists
+                .iter()
+                .enumerate()
+                .map(|(i, mix)| {
+                    let content = format!("{} ({} tracks)", mix.title, mix.track_count);
+                    let style = if i == self.selected_mix_item {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(content).style(style)
+                })
+                .collect()
+        };
+
+        let mix_list = List::new(mix_items)
+            .block(Block::default().borders(Borders::ALL).title("My Mix - Press [m] to expand | [Enter] to add to queue"));
+        frame.render_widget(mix_list, area);
+    }
+
+    fn draw_my_mix_expanded(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        let mix_items: Vec<ListItem> = self.my_mix_playlists
+            .iter()
+            .enumerate()
+            .map(|(i, mix)| {
+                let content = format!("{}. {} ({} tracks)", i + 1, mix.title, mix.track_count);
+                let style = if i == self.selected_mix_item {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(content).style(style)
+            })
+            .collect();
+
+        let mix_list = List::new(mix_items)
+            .block(Block::default().borders(Borders::ALL).title("My Mix (Expanded) - [j/k] Navigate | [Enter] Add to queue | [m] Collapse | [Shift+m] Refresh"));
+        frame.render_widget(mix_list, area);
+    }
+
+    fn draw_player_bar(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let current_track = self.queue.get_current();
         let now_playing = if let Some(track) = current_track {
             format!("Now Playing: {} - {}", track.title, track.uploader)
@@ -259,8 +472,6 @@ impl MusicPlayerApp {
         };
 
         let volume = self.player.get_volume();
-
-        // Show playback progress
         let time_pos = self.player.get_time_pos();
         let duration = self.player.get_duration();
         let time_str = if duration > 0.0 {
@@ -270,7 +481,7 @@ impl MusicPlayerApp {
         };
 
         let player_info = format!(
-            "{}\nState: {} | Volume: {}% | Time: {}\nQueue: {} tracks remaining",
+            "{}\nState: {} | Volume: {}% | Time: {} | Queue: {} tracks remaining",
             now_playing,
             state_str,
             volume,
@@ -280,18 +491,20 @@ impl MusicPlayerApp {
 
         let player_widget = Paragraph::new(player_info)
             .block(Block::default().borders(Borders::ALL).title("Player"));
-        frame.render_widget(player_widget, chunks[2]);
+        frame.render_widget(player_widget, area);
     }
 
-    async fn handle_input(&mut self, key: KeyCode) {
+    async fn handle_input(&mut self, key: KeyEvent) {
         // Clear status message on any key press (except when searching)
         if !matches!(self.mode, AppMode::Searching) {
             self.status_message.clear();
         }
 
+        let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
         match self.mode {
             AppMode::LoginPrompt => {
-                match key {
+                match key.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
                     KeyCode::Char('l') | KeyCode::Char('L') => {
                         self.start_login().await;
@@ -300,7 +513,7 @@ impl MusicPlayerApp {
                 }
             }
             AppMode::AccountPicker => {
-                match key {
+                match key.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                         self.mode = AppMode::LoginPrompt;
                     }
@@ -313,7 +526,7 @@ impl MusicPlayerApp {
                 }
             }
             AppMode::Searching => {
-                match key {
+                match key.code {
                     KeyCode::Char(c) => {
                         self.search_query.push(c);
                     }
@@ -324,20 +537,64 @@ impl MusicPlayerApp {
                         let query = self.search_query.clone();
                         self.perform_search(&query).await;
                         self.mode = AppMode::Normal;
+                        // Switch to Search view
+                        self.previous_view = self.current_view.clone();
+                        self.current_view = ViewMode::Search;
                         self.search_query.clear();
                     }
                     KeyCode::Esc => {
                         self.mode = AppMode::Normal;
                         self.search_query.clear();
+                        // Return to previous view
+                        let temp = self.current_view.clone();
+                        self.current_view = self.previous_view.clone();
+                        self.previous_view = temp;
                     }
                     _ => {}
                 }
             }
             AppMode::Normal => {
-                match key {
+                match key.code {
                     KeyCode::Char('q') => self.should_quit = true,
                     KeyCode::Char('/') => self.mode = AppMode::Searching,
                     KeyCode::Char(' ') => self.toggle_pause(),
+                    KeyCode::Char('h') | KeyCode::Char('H') => {
+                        // Go to home view
+                        self.previous_view = self.current_view.clone();
+                        self.current_view = ViewMode::Home;
+                        self.status_message = "Returned to Home (My Mix)".to_string();
+                    }
+                    KeyCode::Char('m') => {
+                        if has_shift {
+                            // Shift+m: Refresh My Mix (only when expanded)
+                            if self.my_mix_expanded {
+                                self.status_message = "Refreshing My Mix...".to_string();
+                                self.refresh_my_mix().await;
+                            }
+                        } else {
+                            // m: Toggle My Mix expansion
+                            self.my_mix_expanded = !self.my_mix_expanded;
+                            self.status_message = if self.my_mix_expanded {
+                                "My Mix expanded - use j/k to navigate, Shift+m to refresh".to_string()
+                            } else {
+                                "My Mix collapsed".to_string()
+                            };
+                        }
+                    }
+                    KeyCode::Char('M') => {
+                        // Capital M (Shift+m): Refresh My Mix
+                        if self.my_mix_expanded {
+                            self.status_message = "Refreshing My Mix...".to_string();
+                            self.refresh_my_mix().await;
+                        }
+                    }
+                    KeyCode::Esc => {
+                        // Return to previous view
+                        let temp = self.current_view.clone();
+                        self.current_view = self.previous_view.clone();
+                        self.previous_view = temp;
+                        self.status_message = format!("Returned to previous view");
+                    }
                     KeyCode::Char('n') => {
                         self.status_message = "Playing next track...".to_string();
                         self.play_next().await;
@@ -346,13 +603,50 @@ impl MusicPlayerApp {
                         self.status_message = "Playing previous track...".to_string();
                         self.play_previous().await;
                     }
-                    KeyCode::Up => self.volume_up(),
-                    KeyCode::Down => self.volume_down(),
+                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                        self.queue_expanded = !self.queue_expanded;
+                        self.status_message = if self.queue_expanded {
+                            "Queue expanded - use j/k to navigate, d to delete".to_string()
+                        } else {
+                            "Queue collapsed".to_string()
+                        };
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        self.delete_selected_queue_item();
+                    }
+                    KeyCode::Up => self.volume_up(has_shift),
+                    KeyCode::Down => self.volume_down(has_shift),
                     KeyCode::Right => self.seek_forward(),
                     KeyCode::Left => self.seek_backward(),
-                    KeyCode::Char('j') => self.next_search_result(),
-                    KeyCode::Char('k') => self.prev_search_result(),
-                    KeyCode::Enter => self.add_selected_to_queue(),
+                    KeyCode::Char('j') => {
+                        if self.queue_expanded {
+                            self.next_queue_item();
+                        } else if self.my_mix_expanded {
+                            self.next_mix_item();
+                        } else if self.current_view == ViewMode::Home {
+                            self.next_mix_item();
+                        } else {
+                            self.next_search_result();
+                        }
+                    }
+                    KeyCode::Char('k') => {
+                        if self.queue_expanded {
+                            self.prev_queue_item();
+                        } else if self.my_mix_expanded {
+                            self.prev_mix_item();
+                        } else if self.current_view == ViewMode::Home {
+                            self.prev_mix_item();
+                        } else {
+                            self.prev_search_result();
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if self.current_view == ViewMode::Home {
+                            self.add_selected_mix_to_queue().await;
+                        } else {
+                            self.add_selected_to_queue();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -574,17 +868,19 @@ impl MusicPlayerApp {
         self.player.toggle_pause();
     }
 
-    fn volume_up(&mut self) {
+    fn volume_up(&mut self, has_shift: bool) {
         let current = self.player.get_volume();
+        let increment = if has_shift { 5 } else { 1 };
         if current < 100 {
-            self.player.set_volume((current + 5).min(100));
+            self.player.set_volume((current + increment).min(100));
         }
     }
 
-    fn volume_down(&mut self) {
+    fn volume_down(&mut self, has_shift: bool) {
         let current = self.player.get_volume();
+        let decrement = if has_shift { 5 } else { 1 };
         if current > 0 {
-            self.player.set_volume(current.saturating_sub(5));
+            self.player.set_volume(current.saturating_sub(decrement));
         }
     }
 
@@ -612,6 +908,99 @@ impl MusicPlayerApp {
                 self.selected_result -= 1;
             }
         }
+    }
+
+    fn next_queue_item(&mut self) {
+        let queue_len = self.queue.get_queue_list().len();
+        if queue_len > 0 {
+            self.selected_queue_item = (self.selected_queue_item + 1) % queue_len;
+        }
+    }
+
+    fn prev_queue_item(&mut self) {
+        let queue_len = self.queue.get_queue_list().len();
+        if queue_len > 0 {
+            if self.selected_queue_item == 0 {
+                self.selected_queue_item = queue_len - 1;
+            } else {
+                self.selected_queue_item -= 1;
+            }
+        }
+    }
+
+    fn delete_selected_queue_item(&mut self) {
+        if self.queue_expanded && !self.queue.get_queue_list().is_empty() {
+            if let Some(removed_track) = self.queue.remove_at(self.selected_queue_item) {
+                self.status_message = format!("Removed '{}' from queue", removed_track.title);
+
+                // Adjust selection if needed
+                let queue_len = self.queue.get_queue_list().len();
+                if queue_len == 0 {
+                    self.selected_queue_item = 0;
+                } else if self.selected_queue_item >= queue_len {
+                    self.selected_queue_item = queue_len - 1;
+                }
+            }
+        } else if !self.queue_expanded {
+            self.status_message = "Press 't' to expand queue first".to_string();
+        }
+    }
+
+    fn next_mix_item(&mut self) {
+        if !self.my_mix_playlists.is_empty() {
+            self.selected_mix_item = (self.selected_mix_item + 1) % self.my_mix_playlists.len();
+        }
+    }
+
+    fn prev_mix_item(&mut self) {
+        if !self.my_mix_playlists.is_empty() {
+            if self.selected_mix_item == 0 {
+                self.selected_mix_item = self.my_mix_playlists.len() - 1;
+            } else {
+                self.selected_mix_item -= 1;
+            }
+        }
+    }
+
+    async fn add_selected_mix_to_queue(&mut self) {
+        if let Some(mix) = self.my_mix_playlists.get(self.selected_mix_item) {
+            self.status_message = format!("Adding '{}' to queue...", mix.title);
+
+            // TODO: Fetch tracks from the mix playlist and add to queue
+            // For now, just show a message
+            self.status_message = format!("TODO: Fetch and add {} tracks from '{}'", mix.track_count, mix.title);
+        }
+    }
+
+    async fn refresh_my_mix(&mut self) {
+        self.status_message = "Refreshing My Mix playlists...".to_string();
+        self.fetch_my_mix().await;
+    }
+
+    async fn fetch_my_mix(&mut self) {
+        // TODO: Implement My Mix fetching using yt-dlp
+        // For now, add some placeholder data
+        self.my_mix_playlists = vec![
+            MixPlaylist {
+                id: "RDCLAK5uy_example1".to_string(),
+                title: "My Mix".to_string(),
+                track_count: 50,
+                url: "https://music.youtube.com/playlist?list=RDCLAK5uy_example1".to_string(),
+            },
+            MixPlaylist {
+                id: "RDCLAK5uy_example2".to_string(),
+                title: "Discover Mix".to_string(),
+                track_count: 50,
+                url: "https://music.youtube.com/playlist?list=RDCLAK5uy_example2".to_string(),
+            },
+            MixPlaylist {
+                id: "RDCLAK5uy_example3".to_string(),
+                title: "New Release Mix".to_string(),
+                track_count: 30,
+                url: "https://music.youtube.com/playlist?list=RDCLAK5uy_example3".to_string(),
+            },
+        ];
+        self.status_message = "My Mix loaded (placeholder data)".to_string();
     }
 
     fn add_selected_to_queue(&mut self) {

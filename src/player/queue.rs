@@ -60,7 +60,8 @@ use std::collections::VecDeque;
 // Derives:
 // - Debug: Can print track info for debugging (println!("{:?}", track))
 // - Clone: Can make copies of tracks (needed for queue operations)
-#[derive(Debug, Clone)]
+// - Serialize/Deserialize: For saving/loading history to JSON
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     pub video_id: String,
     pub title: String,
@@ -440,6 +441,29 @@ impl Queue {
     }
 
     // ==========================================
+    // QUEUE MANAGEMENT: remove_at()
+    // ==========================================
+    // Removes a specific track from the queue by index and returns it.
+    //
+    // Parameters:
+    // - index: The position in the queue (0 = next to play, 1 = after that, etc.)
+    //
+    // Returns: Option<Track>
+    // - Some(track): Track that was removed
+    // - None: Index was out of bounds (no track at that position)
+    //
+    // This is similar to remove() but returns the removed track
+    // instead of just a boolean. Useful when you need to show
+    // what was removed or add it somewhere else.
+    pub fn remove_at(&mut self, index: usize) -> Option<Track> {
+        if index < self.tracks.len() {
+            self.tracks.remove(index)
+        } else {
+            None
+        }
+    }
+
+    // ==========================================
     // QUEUE INSPECTION: get_queue_list()
     // ==========================================
     // Gets all tracks in the queue as a Vec.
@@ -602,6 +626,37 @@ impl Queue {
     // - get_current() returns None
     pub fn get_current(&self) -> Option<&Track> {
         self.current_track.as_ref()
+    }
+
+    // ==========================================
+    // QUEUE INSPECTION: get_history()
+    // ==========================================
+    // Gets the history of played tracks.
+    //
+    // Returns: &Vec<Track>
+    // - Reference to the vector of previously played tracks
+    // - Order: [oldest ... newest]
+    // - Empty if no tracks have been played yet
+    //
+    // Use case:
+    // - Display "Recently Played" list in UI
+    // - Show what tracks were played in this session
+    pub fn get_history(&self) -> &Vec<Track> {
+        &self.history
+    }
+
+    // ==========================================
+    // QUEUE MANAGEMENT: add_to_history()
+    // ==========================================
+    // Adds a track directly to history (used when loading from persistence).
+    //
+    // Parameters:
+    // - track: The track to add to history
+    //
+    // This bypasses normal playback and directly adds to history.
+    // Useful for restoring history from saved state.
+    pub fn add_to_history(&mut self, track: Track) {
+        self.history.push(track);
     }
 }
 
