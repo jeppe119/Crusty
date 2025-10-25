@@ -67,6 +67,7 @@ pub struct Track {
     pub duration: u64,
     pub uploader: String,
     pub url: String,
+    pub local_file: Option<String>,  // Path to pre-downloaded file
 }
 
 // ==========================================
@@ -113,6 +114,7 @@ impl Track {
             duration,
             uploader,
             url,
+            local_file: None,  // Not pre-downloaded yet
         }
     }
 }

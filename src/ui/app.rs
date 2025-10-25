@@ -15,23 +15,28 @@ use crossterm::{
 };
 use std::io;
 use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 use crate::player::audio::{AudioPlayer, PlayerState};
 use crate::player::queue::{Queue, Track};
 use crate::youtube::extractor::{YouTubeExtractor, VideoInfo};
-use crate::youtube::auth::YouTubeAuth;
+use crate::youtube::browser_auth::{BrowserAuth, BrowserAccount};
 
 enum AppMode {
     Normal,
     Searching,
-    LoginPrompt,  // Show login screen
+    LoginPrompt,   // Show login screen
+    AccountPicker, // Show list of browser accounts
 }
 
 pub struct MusicPlayerApp {
     player: AudioPlayer,
     queue: Queue,
     extractor: YouTubeExtractor,
-    auth: Option<YouTubeAuth>,
+    browser_auth: BrowserAuth,
+    available_accounts: Vec<BrowserAccount>,
+    selected_account_idx: usize,
     search_results: Vec<VideoInfo>,
     selected_result: usize,
     selected_queue_item: usize,
@@ -42,28 +47,29 @@ pub struct MusicPlayerApp {
     search_rx: mpsc::UnboundedReceiver<Vec<VideoInfo>>,
     search_tx: mpsc::UnboundedSender<Vec<VideoInfo>>,
     status_message: String,
+    // Track pre-downloaded files by video_id
+    downloaded_files: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl MusicPlayerApp {
     pub fn new() -> Self {
         let (search_tx, search_rx) = mpsc::unbounded_channel();
 
-        // Try to initialize YouTube auth
-        let auth = match YouTubeAuth::new() {
-            Ok(auth) => {
-                eprintln!("YouTube auth initialized");
-                Some(auth)
-            }
-            Err(e) => {
-                eprintln!("Failed to initialize YouTube auth: {}", e);
-                None
-            }
-        };
+        // Initialize browser auth
+        let browser_auth = BrowserAuth::new().expect("Failed to initialize browser auth");
 
-        // Check if user needs to login
-        let is_authenticated = auth.as_ref()
-            .map(|a| a.is_authenticated())
-            .unwrap_or(false);
+        // Check if user has already selected an account
+        let is_authenticated = browser_auth.is_authenticated();
+
+        let status_message = if is_authenticated {
+            if let Some(account) = browser_auth.load_selected_account() {
+                format!("Welcome back! Logged in as {} - Press '/' to search", account.display_name)
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
 
         let initial_mode = if is_authenticated {
             AppMode::Normal
@@ -75,7 +81,9 @@ impl MusicPlayerApp {
             player: AudioPlayer::new(),
             queue: Queue::new(),
             extractor: YouTubeExtractor::new(),
-            auth,
+            browser_auth,
+            available_accounts: Vec::new(),
+            selected_account_idx: 0,
             search_results: Vec::new(),
             selected_result: 0,
             selected_queue_item: 0,
@@ -85,7 +93,8 @@ impl MusicPlayerApp {
             is_searching: false,
             search_rx,
             search_tx,
-            status_message: String::new(),
+            status_message,
+            downloaded_files: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -147,6 +156,12 @@ impl MusicPlayerApp {
             return;
         }
 
+        // Show account picker
+        if matches!(self.mode, AppMode::AccountPicker) {
+            self.draw_account_picker(frame);
+            return;
+        }
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -165,9 +180,15 @@ impl MusicPlayerApp {
             match self.mode {
                 AppMode::Searching => format!("Search: {}_", self.search_query),
                 AppMode::Normal => {
-                    "Controls: [/]Search [Enter]Add to queue [n]Next [p]Prev [Space]Play/Pause [j/k]Navigate [↑/↓]Volume [q]Quit".to_string()
+                    let account_info = if let Some(account) = self.browser_auth.load_selected_account() {
+                        format!(" | Account: {}", account.display_name)
+                    } else {
+                        String::new()
+                    };
+                    format!("Controls: [/]Search [Enter]Add [n]Next [p]Prev [Space]Play/Pause [j/k]Navigate [↑/↓]Volume [q]Quit{}", account_info)
                 },
                 AppMode::LoginPrompt => "Login Required".to_string(),
+                AppMode::AccountPicker => "Select YouTube Account".to_string(),
             }
         };
         let header = Paragraph::new(title)
@@ -278,6 +299,19 @@ impl MusicPlayerApp {
                     _ => {}
                 }
             }
+            AppMode::AccountPicker => {
+                match key {
+                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                        self.mode = AppMode::LoginPrompt;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => self.next_account(),
+                    KeyCode::Char('k') | KeyCode::Up => self.prev_account(),
+                    KeyCode::Enter => {
+                        self.select_account().await;
+                    }
+                    _ => {}
+                }
+            }
             AppMode::Searching => {
                 match key {
                     KeyCode::Char(c) => {
@@ -351,40 +385,48 @@ impl MusicPlayerApp {
 
     async fn play_next(&mut self) {
         if let Some(track) = self.queue.next() {
-            self.status_message = format!("Loading: {}...", track.title);
+            // Check if already downloaded
+            let pre_downloaded = self.downloaded_files.lock().ok()
+                .and_then(|files| files.get(&track.video_id).cloned());
 
-            // If the URL is a YouTube URL (not a direct stream), fetch the audio URL first
-            if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
-                // Get cookies path if auth is available
-                let cookies_path = self.auth.as_ref().and_then(|auth| auth.get_cookies_path());
+            if let Some(local_file) = pre_downloaded {
+                // Already downloaded! Play immediately (instant skip!)
+                self.player.play(&local_file, &track.title);
+                self.status_message = format!("▶ Now playing: {}", track.title);
+            } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
+                // Need to download it now
+                self.status_message = format!("Downloading: {}...", track.title);
 
-                // Fetch audio URL in a blocking task
+                let cookie_config = self.browser_auth.load_selected_account()
+                    .map(|account| self.browser_auth.get_cookie_arg(&account));
+
                 let youtube_url = track.url.clone();
                 let fetch_result = tokio::task::spawn_blocking(move || {
-                    Self::fetch_audio_url_blocking(&youtube_url, cookies_path)
+                    Self::fetch_audio_url_blocking(&youtube_url, cookie_config)
                 }).await;
 
                 match fetch_result {
-                    Ok(Ok(audio_url)) => {
-                        // Now play the audio in a blocking task
-                        let url_clone = audio_url.clone();
-                        let title_clone = track.title.clone();
-
-                        // Call play in a blocking context
-                        self.player.play(&url_clone, &title_clone);
+                    Ok(Ok(temp_file_path)) => {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        self.player.play(&temp_file_path, &track.title);
                         self.status_message = format!("Now playing: {}", track.title);
+
+                        // Clean up later
+                        let temp_path = temp_file_path.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+                            let _ = std::fs::remove_file(&temp_path);
+                        });
                     }
                     Ok(Err(e)) => {
                         self.status_message = format!("Error: {}", e);
-                        eprintln!("Failed to get audio URL: {}", e);
                     }
                     Err(e) => {
                         self.status_message = format!("Task error: {}", e);
-                        eprintln!("Task join error: {}", e);
                     }
                 }
             } else {
-                // Already have direct URL
+                // Direct URL
                 self.player.play(&track.url, &track.title);
                 self.status_message = format!("Now playing: {}", track.title);
             }
@@ -395,81 +437,137 @@ impl MusicPlayerApp {
 
     async fn play_previous(&mut self) {
         if let Some(track) = self.queue.previous() {
-            self.status_message = format!("Loading: {}...", track.title);
+            // Check if already downloaded
+            let pre_downloaded = self.downloaded_files.lock().ok()
+                .and_then(|files| files.get(&track.video_id).cloned());
 
-            // Same logic as play_next
-            if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
-                // Get cookies path if auth is available
-                let cookies_path = self.auth.as_ref().and_then(|auth| auth.get_cookies_path());
+            if let Some(local_file) = pre_downloaded {
+                // Already downloaded! Play immediately (instant skip!)
+                self.player.play(&local_file, &track.title);
+                self.status_message = format!("◀ Now playing: {}", track.title);
+            } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
+                // Need to download it now
+                self.status_message = format!("Downloading: {}...", track.title);
+
+                let cookie_config = self.browser_auth.load_selected_account()
+                    .map(|account| self.browser_auth.get_cookie_arg(&account));
 
                 let youtube_url = track.url.clone();
                 let fetch_result = tokio::task::spawn_blocking(move || {
-                    Self::fetch_audio_url_blocking(&youtube_url, cookies_path)
+                    Self::fetch_audio_url_blocking(&youtube_url, cookie_config)
                 }).await;
 
                 match fetch_result {
-                    Ok(Ok(audio_url)) => {
-                        self.player.play(&audio_url, &track.title);
-                        self.status_message = format!("Now playing: {}", track.title);
+                    Ok(Ok(temp_file_path)) => {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        self.player.play(&temp_file_path, &track.title);
+                        self.status_message = format!("◀ Now playing: {}", track.title);
+
+                        // Clean up later
+                        let temp_path = temp_file_path.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+                            let _ = std::fs::remove_file(&temp_path);
+                        });
                     }
                     Ok(Err(e)) => {
                         self.status_message = format!("Error: {}", e);
-                        eprintln!("Failed to get audio URL: {}", e);
                     }
                     Err(e) => {
                         self.status_message = format!("Task error: {}", e);
                     }
                 }
             } else {
+                // Direct URL
                 self.player.play(&track.url, &track.title);
-                self.status_message = format!("Now playing: {}", track.title);
+                self.status_message = format!("◀ Now playing: {}", track.title);
             }
         } else {
             self.status_message = "No previous track!".to_string();
         }
     }
 
-    // Helper to fetch audio URL in blocking context
-    fn fetch_audio_url_blocking(youtube_url: &str, cookies_path: Option<std::path::PathBuf>) -> Result<String, String> {
+    // Helper to download audio to temp file using yt-dlp
+    fn fetch_audio_url_blocking(youtube_url: &str, cookie_config: Option<(bool, String)>) -> Result<String, String> {
         use std::process::Command;
+        use std::env;
+        use std::time::{SystemTime, UNIX_EPOCH};
 
-        eprintln!("Fetching audio URL for: {}", youtube_url);
+        // Create unique temp file path for audio download
+        let temp_dir = env::temp_dir();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        let temp_file = temp_dir.join(format!("yt-music-audio-{}-{}.%(ext)s", std::process::id(), timestamp));
 
         let mut cmd = Command::new("yt-dlp");
-        cmd.arg("--get-url")
-            .arg("-f")
-            .arg("bestaudio/best");  // Fallback to best if bestaudio not available
+        cmd.arg("-f")
+            .arg("bestaudio/best")  // Get best audio
+            .arg("-x")              // Extract audio only
+            .arg("--audio-format")
+            .arg("mp3")             // Convert to MP3 (universally supported)
+            .arg("--audio-quality")
+            .arg("192K")            // 192 kbps bitrate
+            .arg("-o")
+            .arg(&temp_file)        // Output to temp file (yt-dlp will replace %(ext)s)
+            .arg("--no-playlist")   // Don't download playlists
+            .arg("--no-mtime");     // Don't preserve modification time
 
-        // Add cookies if available
-        if let Some(cookies) = cookies_path {
-            eprintln!("Using cookies from: {:?}", cookies);
-            cmd.arg("--cookies").arg(cookies);
+        // Add cookies from browser if available
+        if let Some((_use_from_browser, cookie_arg)) = cookie_config {
+            cmd.arg("--cookies-from-browser").arg(cookie_arg);
         }
 
         cmd.arg("--no-check-certificate")  // Skip certificate validation
             .arg(youtube_url);
 
+        // Run yt-dlp and wait for completion
         let output = cmd.output()
             .map_err(|e| format!("Failed to run yt-dlp: {}. Is yt-dlp installed?", e))?;
 
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
-            eprintln!("yt-dlp error: {}", error);
-            return Err(format!("yt-dlp failed: {}", error));
+            return Err(format!("yt-dlp download failed: {}", error));
         }
 
-        let url = String::from_utf8(output.stdout)
-            .map_err(|e| format!("Invalid UTF-8 from yt-dlp: {}", e))?
-            .trim()
-            .to_string();
+        // yt-dlp replaces %(ext)s with actual extension, so find the file
+        let temp_dir_path = env::temp_dir();
+        let search_pattern = format!("yt-music-audio-{}-{}", std::process::id(), timestamp);
 
-        if url.is_empty() {
-            return Err("yt-dlp returned empty URL".to_string());
+        // Find the downloaded file
+        let files: Vec<_> = std::fs::read_dir(&temp_dir_path)
+            .map_err(|e| format!("Failed to read temp dir: {}", e))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.file_name()
+                    .to_string_lossy()
+                    .starts_with(&search_pattern)
+            })
+            .collect();
+
+        if files.is_empty() {
+            return Err(format!("yt-dlp completed but no audio file found (searched for {}.*)", search_pattern));
         }
 
-        eprintln!("Got audio URL (first 100 chars): {}", &url[..url.len().min(100)]);
+        let downloaded_file = files[0].path();
 
-        Ok(url)
+        // Verify file exists and has content
+        let metadata = std::fs::metadata(&downloaded_file)
+            .map_err(|e| format!("Failed to check downloaded file: {}", e))?;
+
+        if metadata.len() == 0 {
+            return Err("Downloaded file is empty".to_string());
+        }
+
+        if metadata.len() < 10000 {
+            return Err(format!("Downloaded file is too small ({} bytes), likely incomplete", metadata.len()));
+        }
+
+        // Give extra time for file system to finish writing
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        Ok(downloaded_file.to_string_lossy().to_string())
     }
 
     fn toggle_pause(&mut self) {
@@ -527,13 +625,33 @@ impl MusicPlayerApp {
             );
 
             let was_empty = self.queue.get_queue_list().is_empty();
+
+            // Start background download for this track
+            let video_id = track.video_id.clone();
+            let youtube_url = track.url.clone();
+            let cookie_config = self.browser_auth.load_selected_account()
+                .map(|account| self.browser_auth.get_cookie_arg(&account));
+            let downloaded_files = self.downloaded_files.clone();
+
+            // Spawn background download
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    Self::fetch_audio_url_blocking(&youtube_url, cookie_config)
+                }).await;
+
+                if let Ok(Ok(file_path)) = result {
+                    // Store the downloaded file path
+                    if let Ok(mut files) = downloaded_files.lock() {
+                        files.insert(video_id, file_path);
+                    }
+                }
+            });
+
             self.queue.add(track);
 
             // Show feedback
-            self.status_message = format!("Added '{}' to queue! ({} total)", video.title, self.queue.get_queue_list().len());
+            self.status_message = format!("Added '{}' to queue! Downloading in background... ({} total)", video.title, self.queue.get_queue_list().len());
 
-            // Don't auto-play here - let user press 'n' to start
-            // Auto-play can crash if yt-dlp takes too long
             if was_empty {
                 self.status_message = format!("Added '{}' to queue! Press 'n' to play", video.title);
             }
@@ -547,40 +665,99 @@ impl MusicPlayerApp {
     }
 
     async fn start_login(&mut self) {
-        self.status_message = "Starting login...".to_string();
+        self.status_message = "Detecting YouTube accounts from browsers...".to_string();
 
-        let auth = match &self.auth {
-            Some(a) => a,
-            None => {
-                self.status_message = "Auth not initialized!".to_string();
-                return;
-            }
-        };
+        // Detect available accounts from Chrome/Firefox/Zen
+        self.available_accounts = self.browser_auth.detect_accounts();
 
-        // Start OAuth flow
-        match auth.start_oauth_flow() {
-            Ok((auth_url, _csrf_token, pkce_verifier)) => {
-                self.status_message = "Opening browser... Complete login there".to_string();
+        if self.available_accounts.is_empty() {
+            self.status_message = "No browser accounts found. Please login to YouTube in Chrome or Firefox first.".to_string();
+        } else {
+            self.status_message = format!("Found {} account(s). Select one:", self.available_accounts.len());
+            self.selected_account_idx = 0;
+            self.mode = AppMode::AccountPicker;
+        }
+    }
 
-                // Open browser
-                if let Err(e) = open::that(&auth_url) {
-                    self.status_message = format!("Failed to open browser: {}. Visit: {}", e, auth_url);
-                    eprintln!("Manual login URL: {}", auth_url);
-                    return;
-                }
+    fn next_account(&mut self) {
+        if !self.available_accounts.is_empty() {
+            self.selected_account_idx = (self.selected_account_idx + 1) % self.available_accounts.len();
+        }
+    }
 
-                // TODO: Start callback server and wait for authorization code
-                // For now, show a message
-                self.status_message = "Login flow started! Check your browser...".to_string();
-
-                // We'll implement the full callback server next
-                // For now, just show that we got here
-                eprintln!("OAuth URL opened. Callback server TODO");
-            }
-            Err(e) => {
-                self.status_message = format!("Login failed: {}", e);
+    fn prev_account(&mut self) {
+        if !self.available_accounts.is_empty() {
+            if self.selected_account_idx == 0 {
+                self.selected_account_idx = self.available_accounts.len() - 1;
+            } else {
+                self.selected_account_idx -= 1;
             }
         }
+    }
+
+    async fn select_account(&mut self) {
+        if let Some(account) = self.available_accounts.get(self.selected_account_idx) {
+            match self.browser_auth.save_selected_account(account) {
+                Ok(_) => {
+                    self.status_message = format!("✓ Logged in as {} - Press '/' to search for music!", account.display_name);
+                    self.mode = AppMode::Normal;
+                }
+                Err(e) => {
+                    self.status_message = format!("Failed to save account: {}", e);
+                }
+            }
+        }
+    }
+
+    fn draw_account_picker(&self, frame: &mut Frame) {
+        use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(20),
+                Constraint::Min(10),
+                Constraint::Percentage(20),
+            ])
+            .split(frame.size());
+
+        // Header
+        let header_text = vec![
+            "Select YouTube Account",
+            "",
+            "Use j/k or ↑/↓ to navigate",
+            "Press Enter to select",
+            "Press Esc to go back",
+            "",
+        ].join("\n");
+
+        let header = Paragraph::new(header_text)
+            .block(Block::default().borders(Borders::ALL).title("Account Selection"))
+            .style(Style::default().fg(Color::Cyan))
+            .alignment(Alignment::Center);
+
+        frame.render_widget(header, chunks[0]);
+
+        // Account list
+        let account_items: Vec<ListItem> = self
+            .available_accounts
+            .iter()
+            .enumerate()
+            .map(|(i, account)| {
+                let content = format!("{}", account.display_name);
+                let style = if i == self.selected_account_idx {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(content).style(style)
+            })
+            .collect();
+
+        let account_list = List::new(account_items)
+            .block(Block::default().borders(Borders::ALL).title("Available Accounts"));
+
+        frame.render_widget(account_list, chunks[1]);
     }
 
     fn draw_login_screen(&self, frame: &mut Frame) {
@@ -599,16 +776,18 @@ impl MusicPlayerApp {
         let login_text = vec![
             "YouTube Music Player",
             "",
-            "Welcome! You need to login with your Google account",
-            "to access YouTube Music and play songs.",
+            "Welcome! To access YouTube Music, you'll select",
+            "a YouTube account from your browser (Chrome/Firefox).",
             "",
-            "Press 'L' to login with Google",
+            "Make sure you're logged into YouTube in your browser first.",
+            "",
+            "Press 'L' to select account",
             "Press 'Q' to quit",
             "",
             if !self.status_message.is_empty() {
                 &self.status_message
             } else {
-                "Waiting for login..."
+                ""
             },
         ].join("\n");
 

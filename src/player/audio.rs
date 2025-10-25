@@ -177,25 +177,21 @@ impl AudioPlayer {
     //
     // Note: This is synchronous and will block briefly while downloading
     // In a real app, you'd want to do this asynchronously or in a background thread
-    pub fn play(&mut self, url: &str, title: &str) {
+    pub fn play(&mut self, file_path: &str, title: &str) {
         // Only try to play if we have a sink (audio device available)
         if let Some(sink) = &self.sink {
             // First, stop any currently playing audio
             sink.stop();
 
-            // Try to download and play the audio
-            // We'll use a blocking HTTP request (could be improved with async)
-            eprintln!("Attempting to download and play: {}", url);
-
+            // Try to decode and play the audio file
             // Wrap the entire operation in a catch_unwind to prevent panics
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Self::download_and_decode(url)
+                Self::decode_from_file(file_path)
             }));
 
             match result {
                 Ok(Ok((decoder, duration))) => {
                     // Successfully got the audio!
-                    eprintln!("Successfully decoded audio, appending to sink");
 
                     // Try to append to sink - this can also panic
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -209,104 +205,38 @@ impl AudioPlayer {
                             self.start_time = Some(Instant::now());
                             self.pause_time = None;
                             self.total_paused_duration = Duration::from_secs(0);
-                            eprintln!("Now playing: {}", title);
                         }
-                        Err(panic_err) => {
-                            eprintln!("Panic while appending to sink: {:?}", panic_err);
+                        Err(_panic_err) => {
                             self.state = PlayerState::Stopped;
                         }
                     }
                 }
-                Ok(Err(e)) => {
+                Ok(Err(_e)) => {
                     // Failed to download/decode
-                    eprintln!("Failed to play audio: {}", e);
                     self.state = PlayerState::Stopped;
                 }
-                Err(panic_err) => {
-                    eprintln!("Panic during download/decode: {:?}", panic_err);
+                Err(_panic_err) => {
                     self.state = PlayerState::Stopped;
                 }
             }
-        } else {
-            eprintln!("No audio device available");
         }
     }
 
-    // Helper function to download and decode audio
+    // Helper function to decode audio from file
     // Returns the decoder and duration
-    fn download_and_decode(url: &str) -> Result<(Decoder<Cursor<Vec<u8>>>, f64), Box<dyn std::error::Error>> {
-        eprintln!("Starting download from: {}", url);
+    fn decode_from_file(file_path: &str) -> Result<(Decoder<std::fs::File>, f64), Box<dyn std::error::Error>> {
+        // Open the file
+        let file = std::fs::File::open(file_path)
+            .map_err(|e| format!("Failed to open audio file: {}", e))?;
 
-        // Wrap everything in a catch to prevent panics
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, Box<dyn std::error::Error>> {
-            // Download the audio data with proper timeout and headers
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-                .build()
-                .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        // Decode the audio format (MP3, M4A, WAV, etc.)
+        let decoder = Decoder::new(file)
+            .map_err(|e| format!("Audio decode failed: {}. File may be corrupted or invalid format.", e))?;
 
-            eprintln!("Sending HTTP GET request...");
-            let response = client.get(url)
-                .send()
-                .map_err(|e| format!("HTTP request failed: {}", e))?;
+        // Try to calculate duration (TODO: implement)
+        let duration = 0.0;
 
-            eprintln!("Got HTTP response, status: {:?}", response.status());
-
-            if !response.status().is_success() {
-                return Err(format!("HTTP error: {}", response.status()).into());
-            }
-
-            eprintln!("Reading response bytes...");
-            let bytes = response.bytes()
-                .map_err(|e| format!("Failed to read response bytes: {}", e))?
-                .to_vec();
-
-            eprintln!("Downloaded {} bytes", bytes.len());
-
-            if bytes.is_empty() {
-                return Err("Downloaded audio is empty".into());
-            }
-
-            // Verify we have actual audio data (check for common audio headers)
-            if bytes.len() < 100 {
-                return Err(format!("Downloaded data too small ({} bytes), likely not valid audio", bytes.len()).into());
-            }
-
-            // Create a cursor (in-memory reader) from the bytes
-            eprintln!("Creating cursor from bytes...");
-            let cursor = Cursor::new(bytes.clone());
-
-            // Decode the audio format (MP3, WAV, etc.)
-            eprintln!("Attempting to decode audio...");
-            let decoder = Decoder::new(cursor)
-                .map_err(|e| {
-                    // Log first few bytes for debugging
-                    let preview = if bytes.len() > 20 {
-                        format!("{:?}...", &bytes[..20])
-                    } else {
-                        format!("{:?}", bytes)
-                    };
-                    eprintln!("Audio data preview: {}", preview);
-                    format!("Audio decode failed: {}. This might not be a valid audio file.", e)
-                })?;
-
-            eprintln!("Audio decoded successfully");
-
-            // Try to calculate duration
-            let duration = 0.0;
-
-            Ok((decoder, duration))
-        }));
-
-        match result {
-            Ok(Ok(data)) => Ok(data),
-            Ok(Err(e)) => Err(e),
-            Err(panic_info) => {
-                eprintln!("Panic caught in download_and_decode: {:?}", panic_info);
-                Err(format!("Panic during download/decode: {:?}", panic_info).into())
-            }
-        }
+        Ok((decoder, duration))
     }
 
     // ==========================================
