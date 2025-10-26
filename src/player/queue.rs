@@ -658,6 +658,57 @@ impl Queue {
     pub fn add_to_history(&mut self, track: Track) {
         self.history.push(track);
     }
+
+    // ==========================================
+    // QUEUE MANAGEMENT: clear_history()
+    // ==========================================
+    // Clears all tracks from the history.
+    //
+    // What happens:
+    // - Removes all previously played tracks from history
+    // - Does NOT affect current track or queue
+    // - After this, history is empty
+    //
+    // Use case:
+    // - User wants to clear their listening history
+    // - Privacy concerns
+    // - Fresh start
+    //
+    // Example:
+    // - Before: Queue=[A, B], Current=C, History=[D, E, F]
+    // - clear_history()
+    // - After: Queue=[A, B], Current=C, History=[]
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+    }
+
+    // ==========================================
+    // QUEUE MANAGEMENT: limit_history()
+    // ==========================================
+    // Limits history to a maximum size, removing oldest entries.
+    //
+    // Parameters:
+    // - max_size: Maximum number of tracks to keep in history
+    //
+    // What happens:
+    // - If history exceeds max_size, removes oldest tracks
+    // - Keeps only the most recent max_size tracks
+    // - Does nothing if history is already smaller than max_size
+    //
+    // Use case:
+    // - Prevent memory issues from unlimited history growth
+    // - Keep only recent listening history
+    //
+    // Example:
+    // - History: [A, B, C, D, E], max_size=3
+    // - limit_history(3)
+    // - History: [C, D, E] (kept most recent 3)
+    pub fn limit_history(&mut self, max_size: usize) {
+        if self.history.len() > max_size {
+            let excess = self.history.len() - max_size;
+            self.history.drain(0..excess);
+        }
+    }
 }
 
 // ==========================================

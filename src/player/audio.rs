@@ -178,6 +178,10 @@ impl AudioPlayer {
     // Note: This is synchronous and will block briefly while downloading
     // In a real app, you'd want to do this asynchronously or in a background thread
     pub fn play(&mut self, file_path: &str, title: &str) {
+        self.play_with_duration(file_path, title, 0.0);
+    }
+
+    pub fn play_with_duration(&mut self, file_path: &str, title: &str, known_duration: f64) {
         // Only try to play if we have a sink (audio device available)
         if let Some(sink) = &self.sink {
             // First, stop any currently playing audio
@@ -190,7 +194,7 @@ impl AudioPlayer {
             }));
 
             match result {
-                Ok(Ok((decoder, duration))) => {
+                Ok(Ok((decoder, _file_duration))) => {
                     // Successfully got the audio!
 
                     // Try to append to sink - this can also panic
@@ -199,6 +203,13 @@ impl AudioPlayer {
                     })) {
                         Ok(_) => {
                             // Update our state
+                            // Use known_duration if provided, otherwise use file duration
+                            let duration = if known_duration > 0.0 {
+                                known_duration
+                            } else {
+                                _file_duration
+                            };
+
                             self.state = PlayerState::Playing;
                             self.current_title = title.to_string();
                             self.duration = duration;

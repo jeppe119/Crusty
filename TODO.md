@@ -1,36 +1,48 @@
 # TODO List - YouTube Music Player
 
-## High Priority
+## Completed ✅
 
 ### My Mix Implementation
-- [ ] Implement real My Mix fetching using yt-dlp
-  - Use `yt-dlp --cookies-from-browser firefox:<profile> --flat-playlist --dump-json "https://music.youtube.com"`
-  - Parse YouTube Music auto-generated playlists
-  - Extract: playlist ID, title, track count, URL
-- [ ] Implement fetching tracks from selected mix playlist
-  - Get individual video IDs from playlist
-  - Add all tracks to queue with background downloading
-- [ ] Test My Mix with real YouTube Music account
-- [ ] Handle edge cases (no mixes found, network errors, etc.)
+- [x] Implement real My Mix fetching using yt-dlp
+- [x] Implement fetching tracks from selected mix playlist
+- [x] Test My Mix with real YouTube Music account
+- [x] Handle edge cases (no mixes found, network errors, etc.)
 
 ### History Management
-- [ ] Add "Clear History" functionality (keybind or menu)
-- [ ] Limit history size to prevent memory issues (e.g., keep last 100 tracks)
-- [ ] Add history search/filter capability
+- [x] Add "Clear History" functionality (Shift+H to expand, Shift+C to clear)
+- [x] Limit history size to prevent memory issues (limited to 100 tracks)
+- [x] History persistence across app restarts
 
 ### Queue Pre-downloading
-- [ ] Implement cleanup of old pre-downloaded files
-- [ ] Add download progress indicator for background downloads
-- [ ] Handle download failures gracefully
+- [x] Implement smart 3-track buffer (prevents memory/CPU overload)
+- [x] Implement cleanup of old pre-downloaded files (1 hour threshold)
+- [x] Handle download failures gracefully (retry logic + failed tracking)
+
+### UI/UX Improvements
+- [x] Add visual progress bar for currently playing track
+- [x] Add help screen (press `?` to show all keybinds)
+- [x] Make queue vertical layout (10 tracks visible in compact, scrollable when expanded)
+- [x] Add My Mix expansion (press 'm' to expand, Shift+M to refresh)
+- [x] Add History expansion (Shift+H to expand/collapse)
+- [x] Add view management (Home/Search views with 'h' and Esc navigation)
+- [x] Clean video title tags (removes "(Official Video)", "(Lyric Video)", etc.)
+
+### Playlist Management
+- [x] Import playlists from YouTube URLs (press 'l' to load)
+- [x] Display first 50 tracks from loaded playlist
+
+## High Priority
+
+### History Management (Remaining)
+- [ ] Add history search/filter capability
+- [ ] Cherry-pick delete individual history items
 
 ## Medium Priority
 
-### UI/UX Improvements
-- [ ] Add visual progress bar for currently playing track
+### UI/UX Improvements (Remaining)
 - [ ] Show download status indicators (⬇ for downloading, ✓ for ready)
 - [ ] Add album art/thumbnails display (if feasible in terminal)
 - [ ] Improve status messages with colors and icons
-- [ ] Add help screen (press `?` to show all keybinds)
 
 ### Playback Features
 - [ ] Implement seeking (forward/backward with arrow keys)
@@ -39,11 +51,11 @@
 - [ ] Implement crossfade between tracks
 - [ ] Add equalizer presets
 
-### Playlist Management
+### Playlist Management (Remaining)
 - [ ] Save custom playlists to disk
 - [ ] Load/create/edit custom playlists
-- [ ] Import playlists from YouTube URLs
 - [ ] Export queue as playlist
+- [ ] Add optional ytmusicapi integration for better My Mix support
 
 ## Low Priority
 

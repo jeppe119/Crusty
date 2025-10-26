@@ -37,6 +37,9 @@ tracing-subscriber = "0.3"
 # Directory paths (for config storage)
 dirs = "5.0"
 
+# Regex for title cleaning
+regex = "1.10"
+
 # No longer needed - we use browser cookies instead of OAuth
 
 [profile.release]
