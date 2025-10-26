@@ -502,6 +502,55 @@ impl Queue {
     }
 
     // ==========================================
+    // QUEUE INSPECTION: get_queue_slice()
+    // ==========================================
+    // Gets a slice of tracks from the queue without cloning.
+    //
+    // Parameters:
+    // - start: Starting index
+    // - count: Number of tracks to return
+    //
+    // Returns: Vec<&Track>
+    // - References to tracks in the specified range
+    // - Much faster than get_queue_list() for large queues
+    //
+    // Use case:
+    // - Display only visible portion of queue in UI
+    // - Avoid cloning hundreds of tracks when only showing 10
+    pub fn get_queue_slice(&self, start: usize, count: usize) -> Vec<&Track> {
+        self.tracks
+            .iter()
+            .skip(start)
+            .take(count)
+            .collect()
+    }
+
+    // Get queue length without cloning
+    pub fn len(&self) -> usize {
+        self.tracks.len()
+    }
+
+    // ==========================================
+    // PLAYBACK: start_or_next()
+    // ==========================================
+    // Smart playback method that:
+    // - If nothing playing, starts first track (doesn't skip it)
+    // - If something playing, goes to next track
+    //
+    // This prevents the "first press skips first song" bug
+    pub fn start_or_next(&mut self) -> Option<Track> {
+        if self.current_track.is_none() && !self.tracks.is_empty() {
+            // Nothing playing - start first track without history
+            let track = self.tracks.pop_front()?;
+            self.current_track = Some(track.clone());
+            Some(track)
+        } else {
+            // Already playing - use normal next logic
+            self.next()
+        }
+    }
+
+    // ==========================================
     // QUEUE INSPECTION: is_empty()
     // ==========================================
     // Checks if the queue is empty.
@@ -708,6 +757,31 @@ impl Queue {
             let excess = self.history.len() - max_size;
             self.history.drain(0..excess);
         }
+    }
+
+    // ==========================================
+    // QUEUE MANAGEMENT: restore_queue()
+    // ==========================================
+    // Restores queue state from persistence.
+    //
+    // Parameters:
+    // - tracks: Vec<Track> - The tracks to restore to the queue
+    // - current_track: Option<Track> - The track that was playing (if any)
+    //
+    // What happens:
+    // - Clears current queue
+    // - Adds all tracks from persistence
+    // - Restores current track (if provided)
+    //
+    // Use case:
+    // - Loading saved queue on app startup
+    // - Restoring session after crash
+    pub fn restore_queue(&mut self, tracks: Vec<Track>, current_track: Option<Track>) {
+        self.tracks.clear();
+        for track in tracks {
+            self.tracks.push_back(track);
+        }
+        self.current_track = current_track;
     }
 }
 
