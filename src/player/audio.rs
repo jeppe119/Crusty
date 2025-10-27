@@ -34,6 +34,7 @@ pub enum PlayerState {
     Stopped, // No audio loaded or playback has been stopped
     Playing, // Audio is currently playing
     Paused,  // Audio is loaded but temporarily paused
+    Loading, // Audio is being loaded/decoded (transitional state)
 }
 
 // ==========================================
@@ -184,6 +185,10 @@ impl AudioPlayer {
     pub fn play_with_duration(&mut self, file_path: &str, title: &str, known_duration: f64) {
         // Only try to play if we have a sink (audio device available)
         if let Some(sink) = &self.sink {
+            // Set state to Loading BEFORE stopping to prevent race condition
+            // This prevents auto-advance logic from thinking track finished
+            self.state = PlayerState::Loading;
+
             // First, stop any currently playing audio
             sink.stop();
 

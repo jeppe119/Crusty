@@ -106,6 +106,8 @@ pub struct MusicPlayerApp {
     animation_frame: u8,
     // Title scroll position for rotating long titles
     title_scroll_offset: usize,
+    // Track background download tasks for proper cleanup
+    background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl MusicPlayerApp {
@@ -188,6 +190,7 @@ impl MusicPlayerApp {
             active_downloads: Arc::new(Mutex::new(0)),
             animation_frame: 0,
             title_scroll_offset: 0,
+            background_tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -510,6 +513,8 @@ impl MusicPlayerApp {
             }
 
             // Auto-advance to next track when current finishes
+            // IMPORTANT: Only auto-advance when state is Playing (not Loading, Stopped, or Paused)
+            // This prevents race condition where sink is empty during track loading
             if self.player.is_finished() && self.player.get_state() == PlayerState::Playing {
                 if !self.queue.is_empty() {
                     self.status_message = "Track finished, playing next...".to_string();
@@ -531,13 +536,15 @@ impl MusicPlayerApp {
             }
         }
 
-        // CRITICAL: Kill all background yt-dlp processes before saving!
+        // CRITICAL: Abort all background download tasks before saving!
         eprintln!("Cleaning up background downloads...");
-        std::process::Command::new("pkill")
-            .arg("-f")
-            .arg("yt-dlp")
-            .output()
-            .ok();
+        if let Ok(mut tasks) = self.background_tasks.lock() {
+            for handle in tasks.drain(..) {
+                handle.abort();
+            }
+        }
+        // Give tasks a moment to abort gracefully
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Save history and queue before quitting
         if let Err(e) = self.save_history() {
@@ -1047,6 +1054,7 @@ impl MusicPlayerApp {
             PlayerState::Playing => "▶ Playing",
             PlayerState::Paused => "⏸ Paused",
             PlayerState::Stopped => "⏹ Stopped",
+            PlayerState::Loading => "... Loading",
         };
 
         let volume = self.player.get_volume();
@@ -1098,6 +1106,7 @@ impl MusicPlayerApp {
             PlayerState::Playing => "▶ Playing",
             PlayerState::Paused => "⏸ Paused",
             PlayerState::Stopped => "⏹ Stopped",
+            PlayerState::Loading => "... Loading",
         };
 
         let volume = self.player.get_volume();
@@ -1172,6 +1181,7 @@ impl MusicPlayerApp {
             PlayerState::Playing => "▶ Playing",
             PlayerState::Paused => "⏸ Paused",
             PlayerState::Stopped => "⏹ Stopped",
+            PlayerState::Loading => "... Loading",
         };
 
         let volume = self.player.get_volume();
@@ -1660,7 +1670,7 @@ impl MusicPlayerApp {
         let active_downloads = self.active_downloads.clone();
         let download_tx = self.download_tx.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 Self::fetch_audio_url_blocking(&youtube_url, cookie_config)
             }).await;
@@ -1694,6 +1704,11 @@ impl MusicPlayerApp {
                 *count = count.saturating_sub(1);
             }
         });
+
+        // Track the background task for proper cleanup
+        if let Ok(mut tasks) = self.background_tasks.lock() {
+            tasks.push(handle);
+        }
 
         true  // Download was spawned
     }
@@ -1778,8 +1793,7 @@ impl MusicPlayerApp {
             cmd.arg("--cookies-from-browser").arg(cookie_arg);
         }
 
-        cmd.arg("--no-check-certificate")  // Skip certificate validation
-            .arg(youtube_url);
+        cmd.arg(youtube_url);
 
         // Run yt-dlp and wait for completion
         let output = cmd.output()
@@ -2373,7 +2387,7 @@ impl MusicPlayerApp {
             let failed_downloads = self.failed_downloads.clone();
 
             // Spawn background download
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     Self::fetch_audio_url_blocking(&youtube_url, cookie_config)
                 }).await;
@@ -2400,6 +2414,11 @@ impl MusicPlayerApp {
                     }
                 }
             });
+
+            // Track the background task for proper cleanup
+            if let Ok(mut tasks) = self.background_tasks.lock() {
+                tasks.push(handle);
+            }
 
             self.queue.add(track);
 
