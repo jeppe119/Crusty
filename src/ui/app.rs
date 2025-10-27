@@ -108,6 +108,8 @@ pub struct MusicPlayerApp {
     title_scroll_offset: usize,
     // Track background download tasks for proper cleanup
     background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    // Time-based animation tracking (prevents mouse movement from speeding up animations)
+    last_animation_update: std::time::Instant,
 }
 
 impl MusicPlayerApp {
@@ -191,6 +193,7 @@ impl MusicPlayerApp {
             animation_frame: 0,
             title_scroll_offset: 0,
             background_tasks: Arc::new(Mutex::new(Vec::new())),
+            last_animation_update: std::time::Instant::now(),
         }
     }
 
@@ -356,15 +359,47 @@ impl MusicPlayerApp {
                 let track_count = queue_state.tracks.len();
                 self.queue.restore_queue(queue_state.tracks, queue_state.current_track);
                 self.queue_loaded = true;
-                self.status_message = format!("Restored {} tracks from previous session", track_count);
 
-                // CRITICAL: Pre-download current track FIRST (for instant playback on Space)
+                // CRITICAL: Download the track that will play FIRST with absolute priority
+                let mut downloads_started = 0;
+                let has_current = self.queue.get_current().is_some();
+
                 if let Some(current_track) = self.queue.get_current() {
-                    self.spawn_download_with_limit(current_track);
+                    // Current track exists - download it with HIGHEST priority (plays on Space)
+                    if self.spawn_download_with_limit(current_track) {
+                        downloads_started += 1;
+                    }
                 }
 
-                // Then pre-download next 10 tracks from queue position 0 (lightweight!)
-                self.trigger_smart_downloads();
+                // Download queue tracks (next to play)
+                let next_tracks = self.queue.get_queue_slice(0, 20);
+                for (idx, track) in next_tracks.iter().enumerate() {
+                    if idx == 0 && !has_current {
+                        // CRITICAL: If no current track, first queue track is HIGHEST priority
+                        // This ensures instant playback when user presses Space for first time
+                        if self.spawn_download_with_limit(track) {
+                            downloads_started += 1;
+                        }
+                    } else {
+                        // Lower priority - buffer downloads
+                        if self.spawn_download_with_limit(track) {
+                            downloads_started += 1;
+                        }
+                    }
+                }
+
+                if downloads_started > 0 {
+                    let priority_info = if has_current {
+                        "current track ready soon"
+                    } else if !next_tracks.is_empty() {
+                        "first track ready soon"
+                    } else {
+                        "downloading"
+                    };
+                    self.status_message = format!("Restored {} tracks - {} ({} downloading)", track_count, priority_info, downloads_started);
+                } else {
+                    self.status_message = format!("Restored {} tracks from previous session", track_count);
+                }
             }
             Ok(Err(e)) => {
                 eprintln!("Failed to load queue: {}", e);
@@ -427,20 +462,37 @@ impl MusicPlayerApp {
         // Trigger async queue load on first iteration
         let mut queue_load_triggered = false;
 
+        // Frame rate limiting: render at ~20 FPS (50ms per frame)
+        // This prevents excessive CPU usage and gives async tasks more time
+        let frame_duration = std::time::Duration::from_millis(50);
+        let mut last_render = std::time::Instant::now();
+
         loop {
             // Load queue asynchronously on first iteration (non-blocking)
             if !queue_load_triggered {
                 queue_load_triggered = true;
                 self.load_queue_async().await;
             }
-            terminal.draw(|f| self.draw_ui(f))?;
 
-            // Increment animation frame for download indicator
-            self.animation_frame = self.animation_frame.wrapping_add(1);
+            // Only render if enough time has passed (frame rate limiting)
+            let now = std::time::Instant::now();
+            let should_render = now.duration_since(last_render) >= frame_duration;
 
-            // Increment title scroll every 10 frames (slower scroll)
-            if self.animation_frame % 10 == 0 {
+            if should_render {
+                terminal.draw(|f| self.draw_ui(f))?;
+                last_render = now;
+            }
+
+            // Time-based animation updates (prevents mouse movement from speeding up animations)
+            // Update animations at much slower rate for subtle, non-distracting effect
+            let animation_interval = std::time::Duration::from_millis(150); // ~6.6 FPS for subtle animations
+            if now.duration_since(self.last_animation_update) >= animation_interval {
+                self.animation_frame = self.animation_frame.wrapping_add(1);
+
+                // Scroll title text slowly for readability
                 self.title_scroll_offset = self.title_scroll_offset.wrapping_add(1);
+
+                self.last_animation_update = now;
             }
 
             // Check for search results
@@ -458,7 +510,8 @@ impl MusicPlayerApp {
                         // Download succeeded! Play it if it's the pending track
                         if let Some(track) = &self.pending_play_track {
                             if track.video_id == video_id {
-                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                // Use async sleep instead of blocking thread sleep
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                 self.player.play_with_duration(&temp_file_path, &track.title, track.duration as f64);
                                 self.status_message = "".to_string();  // Clear status - player shows track
                                 self.pending_play_track = None;
@@ -525,10 +578,16 @@ impl MusicPlayerApp {
                 }
             }
 
-            if event::poll(std::time::Duration::from_millis(100))? {
+            // Poll for events with shorter timeout to keep UI responsive
+            // but yield to tokio runtime frequently for background tasks
+            if event::poll(std::time::Duration::from_millis(16))? {
                 if let Event::Key(key) = event::read()? {
                     self.handle_input(key).await;
                 }
+            } else {
+                // No events - yield to tokio runtime to process background tasks
+                // This is CRITICAL for download performance when window is unfocused
+                tokio::task::yield_now().await;
             }
 
             if self.should_quit {
@@ -1624,18 +1683,19 @@ impl MusicPlayerApp {
     // All other code paths must call this function.
     //
     // Features:
-    // - Global rate limiting (max 15 concurrent downloads for fast bulk downloading)
+    // - Global rate limiting (max 30 concurrent downloads for fast bulk downloading)
     // - Populates cache only (not tied to specific playback)
     // - Tracks active downloads with atomic counter
     // - Handles success/failure and updates appropriate maps
     fn spawn_download_with_limit(&self, track: &Track) -> bool {
-        // RATE LIMIT: Allow up to 15 concurrent downloads for fast bulk downloading
+        // RATE LIMIT: Allow up to 30 concurrent downloads for fast bulk downloading
+        // Increased from 15 to improve performance, especially when window is unfocused
         let active_count = {
             let count = self.active_downloads.lock().ok();
             count.map(|c| *c).unwrap_or(0)
         };
 
-        if active_count >= 15 {
+        if active_count >= 30 {
             // Already at max downloads, skip
             return false;
         }
@@ -1715,12 +1775,12 @@ impl MusicPlayerApp {
 
     // Trigger smart downloads: download tracks near current position
     fn trigger_smart_downloads(&self) {
-        // Smart strategy: Download next 10 tracks from queue
-        // Minimal CPU usage while maintaining instant playback for nearby tracks
+        // Smart strategy: Download next 20 tracks from queue for smooth playback
+        // With 30 concurrent downloads max, this provides good buffering
         // History tracks stay cached automatically (never deleted)
 
-        // Download next 10 tracks from queue position 0
-        let next_tracks = self.queue.get_queue_slice(0, 10);
+        // Download next 20 tracks from queue position 0 (increased for better UX)
+        let next_tracks = self.queue.get_queue_slice(0, 20);
         for track in next_tracks.iter() {
             self.spawn_download_with_limit(track);
         }
@@ -2026,8 +2086,8 @@ impl MusicPlayerApp {
     fn trigger_hover_download(&self, index: usize) {
         // SLIDING WINDOW STRATEGY:
         // Download ONLY 1 track at position +15 from hover
-        // This maintains a 15-track buffer while only downloading 1 track per keypress
-        // Super efficient - no CPU spikes!
+        // This maintains a 15-track lookahead buffer while only downloading 1 track per keypress
+        // Super efficient - no CPU spikes! (Max 30 concurrent downloads total)
         let download_index = index + 15;
 
         // Get the track at position +15
