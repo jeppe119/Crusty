@@ -597,14 +597,47 @@ impl AudioPlayer {
     // Checks if the current track has finished playing.
     //
     // Returns: bool
-    // - true: Track finished (sink is empty)
+    // - true: Track finished (sink is empty AND minimum time has elapsed)
     // - false: Track still playing or paused
     //
     // This is useful for auto-advancing to next track
+    //
+    // IMPORTANT: We use a time-based guard to prevent rapid auto-advance bugs
+    // where the sink might be briefly empty during track loading/buffering.
     pub fn is_finished(&self) -> bool {
         if let Some(sink) = &self.sink {
-            // If sink is empty and we're in playing state, track finished
-            sink.empty()
+            // First check: sink must be empty
+            if !sink.empty() {
+                return false;
+            }
+
+            // Second check: Must have a start time (track actually started)
+            if let Some(start) = self.start_time {
+                // Calculate real elapsed time (wall clock, not playback time)
+                // This is important because we need to detect rapid state changes
+                let elapsed = Instant::now().duration_since(start).as_secs_f64();
+
+                // CRITICAL: NEVER consider track finished within first 2 seconds
+                // This prevents the race condition where:
+                // 1. Track finishes -> sink becomes empty
+                // 2. Auto-advance starts next track -> sink still empty during load
+                // 3. is_finished() called again -> would return true again
+                // 4. Another auto-advance triggered -> rapid queue clearing!
+                //
+                // The 2-second guard ensures the track has been "started" long enough
+                // that we're not in the middle of a track transition.
+                if elapsed < 2.0 {
+                    return false;
+                }
+
+                // After 2 seconds, track is legitimately finished if sink is empty
+                // (No duration check needed - if it played for 2+ seconds and sink is empty, it's done)
+                return true;
+            } else {
+                // No start time - track never actually started playing
+                // Return false to prevent skipping tracks that failed to load
+                return false;
+            }
         } else {
             false
         }
