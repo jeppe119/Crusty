@@ -1,7 +1,7 @@
 [package]
 name = "crusty"
 version = "0.1.0"
-edition = "2025"
+edition = "2021"
 authors = ["Newid"]
 description = "A terminal-based music player that downloads playlist from YouTube"
 
