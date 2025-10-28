@@ -1616,9 +1616,19 @@ impl MusicPlayerApp {
                 .and_then(|files| files.get(&track.video_id).cloned());
 
             if let Some(local_file) = cached_file {
-                // ✅ INSTANT PLAYBACK - Already in cache!
-                self.player.play_with_duration(&local_file, &track.title, track.duration as f64);
-                self.status_message = "".to_string();  // Clear status - player shows track
+                // Verify file actually exists before playing (5-min cleanup might have deleted it)
+                if std::path::Path::new(&local_file).exists() {
+                    // ✅ INSTANT PLAYBACK - Already in cache!
+                    self.player.play_with_duration(&local_file, &track.title, track.duration as f64);
+                    self.status_message = "".to_string();  // Clear status - player shows track
+                } else {
+                    // File was deleted - remove from cache and re-download
+                    self.downloaded_files.lock().ok().map(|mut files| files.remove(&track.video_id));
+                    self.pending_play_track = Some(track.clone());
+                    if self.spawn_download_with_limit(&track) {
+                        self.currently_downloading = Some(track.title.clone());
+                    }
+                }
             } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
                 // Not in cache - spawn download (rate-limited!)
                 // Always set pending track (even if rate limited - will retry when slot opens)
@@ -1653,9 +1663,19 @@ impl MusicPlayerApp {
                 .and_then(|files| files.get(&track.video_id).cloned());
 
             if let Some(local_file) = cached_file {
-                // ✅ INSTANT PLAYBACK - Already in cache!
-                self.player.play_with_duration(&local_file, &track.title, track.duration as f64);
-                self.status_message = "".to_string();  // Clear status - player shows track
+                // Verify file actually exists before playing (5-min cleanup might have deleted it)
+                if std::path::Path::new(&local_file).exists() {
+                    // ✅ INSTANT PLAYBACK - Already in cache!
+                    self.player.play_with_duration(&local_file, &track.title, track.duration as f64);
+                    self.status_message = "".to_string();  // Clear status - player shows track
+                } else {
+                    // File was deleted - remove from cache and re-download
+                    self.downloaded_files.lock().ok().map(|mut files| files.remove(&track.video_id));
+                    self.pending_play_track = Some(track.clone());
+                    if self.spawn_download_with_limit(&track) {
+                        self.currently_downloading = Some(track.title.clone());
+                    }
+                }
             } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
                 // Not in cache - spawn download (rate-limited!)
                 // Always set pending track (even if rate limited - will retry when slot opens)

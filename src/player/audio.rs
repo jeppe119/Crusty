@@ -224,15 +224,18 @@ impl AudioPlayer {
                         }
                         Err(_panic_err) => {
                             self.state = PlayerState::Stopped;
+                            self.start_time = None;  // Clear start time to prevent false is_finished()
                         }
                     }
                 }
                 Ok(Err(_e)) => {
                     // Failed to download/decode
                     self.state = PlayerState::Stopped;
+                    self.start_time = None;  // Clear start time to prevent false is_finished()
                 }
                 Err(_panic_err) => {
                     self.state = PlayerState::Stopped;
+                    self.start_time = None;  // Clear start time to prevent false is_finished()
                 }
             }
         }
