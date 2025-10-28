@@ -1,9 +1,9 @@
 [package]
-name = "youtube-music-player-rust"
+name = "crusty"
 version = "0.1.0"
-edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
-description = "A terminal-based music player that streams from YouTube"
+edition = "2025"
+authors = ["Newid"]
+description = "A terminal-based music player that downloads playlist from YouTube"
 
 [dependencies]
 # Async runtime
