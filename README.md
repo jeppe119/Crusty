@@ -68,6 +68,11 @@ Because everything is better rewritten in Rust™
 yay -S yt-dlp
 
 # Rust (if you somehow don't have it)
+# Arch/Manjaro:
+sudo pacman -S rustup
+rustup default stable
+
+# Or the official way (other distros):
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
