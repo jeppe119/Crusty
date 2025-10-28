@@ -1,7 +1,5 @@
 <div align="center">
-  <img src="Crusty.png" alt="Crusty" width="200" align="left" />
-  <img src="Crusty2.png" alt="Crusty Logo" width="500" />
-  <br clear="left"/>
+  <img src="Crusty.png" alt="Crusty" width="250" />
   <p><i>Because scrolling through YouTube on your phone is too mainstream ¯\_(ツ)_/¯</i></p>
 </div>
 
