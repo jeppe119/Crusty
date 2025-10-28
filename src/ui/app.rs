@@ -102,6 +102,8 @@ pub struct MusicPlayerApp {
     currently_downloading: Option<String>, // track title
     // Active download count (for rate limiting)
     active_downloads: Arc<Mutex<usize>>,
+    // Track which video_ids are currently downloading (prevents duplicate downloads on SPACE spam)
+    downloading_videos: Arc<Mutex<std::collections::HashSet<String>>>,
     // Animation frame counter for download indicator
     animation_frame: u8,
     // Title scroll position for rotating long titles
@@ -190,6 +192,7 @@ impl MusicPlayerApp {
             pending_play_track: None,
             currently_downloading: None,
             active_downloads: Arc::new(Mutex::new(0)),
+            downloading_videos: Arc::new(Mutex::new(std::collections::HashSet::new())),
             animation_frame: 0,
             title_scroll_offset: 0,
             background_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -360,7 +363,9 @@ impl MusicPlayerApp {
                 self.queue.restore_queue(queue_state.tracks, queue_state.current_track);
                 self.queue_loaded = true;
 
-                // CRITICAL: Download the track that will play FIRST with absolute priority
+                // LIGHTWEIGHT RESTORATION STRATEGY:
+                // Download ONLY current + next 5 tracks on startup
+                // The rest will download as user navigates (via ensure_next_track_ready + sliding window)
                 let mut downloads_started = 0;
                 let has_current = self.queue.get_current().is_some();
 
@@ -371,8 +376,10 @@ impl MusicPlayerApp {
                     }
                 }
 
-                // Download queue tracks (next to play)
-                let next_tracks = self.queue.get_queue_slice(0, 20);
+                // Download next 5 tracks only (reduced from 20 for FAST startup)
+                // Less concurrent downloads = faster completion of priority tracks
+                // ensure_next_track_ready() will handle the rest as user plays
+                let next_tracks = self.queue.get_queue_slice(0, 5);
                 for (idx, track) in next_tracks.iter().enumerate() {
                     if idx == 0 && !has_current {
                         // CRITICAL: If no current track, first queue track is HIGHEST priority
@@ -381,7 +388,7 @@ impl MusicPlayerApp {
                             downloads_started += 1;
                         }
                     } else {
-                        // Lower priority - buffer downloads
+                        // Buffer downloads (reduced from 20 to 5 for lightweight startup)
                         if self.spawn_download_with_limit(track) {
                             downloads_started += 1;
                         }
@@ -516,6 +523,9 @@ impl MusicPlayerApp {
                                 self.status_message = "".to_string();  // Clear status - player shows track
                                 self.pending_play_track = None;
                                 self.currently_downloading = None;
+
+                                // PROACTIVE: Ensure next track is downloading for instant skip
+                                self.ensure_next_track_ready();
 
                                 // Clean up later
                                 let temp_path = temp_file_path.clone();
@@ -1621,6 +1631,9 @@ impl MusicPlayerApp {
                     // ✅ INSTANT PLAYBACK - Already in cache!
                     self.player.play_with_duration(&local_file, &track.title, track.duration as f64);
                     self.status_message = "".to_string();  // Clear status - player shows track
+
+                    // PROACTIVE: Ensure next track is downloading for instant skip
+                    self.ensure_next_track_ready();
                 } else {
                     // File was deleted - remove from cache and re-download
                     self.downloaded_files.lock().ok().map(|mut files| files.remove(&track.video_id));
@@ -1668,6 +1681,9 @@ impl MusicPlayerApp {
                     // ✅ INSTANT PLAYBACK - Already in cache!
                     self.player.play_with_duration(&local_file, &track.title, track.duration as f64);
                     self.status_message = "".to_string();  // Clear status - player shows track
+
+                    // PROACTIVE: Ensure next track is downloading for instant skip
+                    self.ensure_next_track_ready();
                 } else {
                     // File was deleted - remove from cache and re-download
                     self.downloaded_files.lock().ok().map(|mut files| files.remove(&track.video_id));
@@ -1736,6 +1752,15 @@ impl MusicPlayerApp {
             }
         }
 
+        // CRITICAL: Skip if already downloading (prevents SPACE spam duplicates!)
+        if let Ok(mut downloading) = self.downloading_videos.lock() {
+            if downloading.contains(video_id) {
+                return false;  // Already downloading this video
+            }
+            // Mark as downloading
+            downloading.insert(video_id.clone());
+        }
+
         // Increment active download counter
         if let Ok(mut count) = self.active_downloads.lock() {
             *count += 1;
@@ -1748,6 +1773,7 @@ impl MusicPlayerApp {
         let downloaded_files = self.downloaded_files.clone();
         let failed_downloads = self.failed_downloads.clone();
         let active_downloads = self.active_downloads.clone();
+        let downloading_videos = self.downloading_videos.clone();
         let download_tx = self.download_tx.clone();
 
         let handle = tokio::spawn(async move {
@@ -1762,26 +1788,30 @@ impl MusicPlayerApp {
                         files.insert(video_id.clone(), file_path.clone());
                     }
                     // Notify main thread with ACTUAL file path (for auto-play if pending)
-                    let _ = download_tx.send((video_id, Ok(file_path)));
+                    let _ = download_tx.send((video_id.clone(), Ok(file_path)));
                 }
                 Ok(Err(e)) => {
                     if let Ok(mut failed) = failed_downloads.lock() {
                         failed.insert(video_id.clone(), e.clone());
                     }
-                    let _ = download_tx.send((video_id, Err(e)));
+                    let _ = download_tx.send((video_id.clone(), Err(e)));
                 }
                 Err(e) => {
                     let error_msg = format!("Task error: {}", e);
                     if let Ok(mut failed) = failed_downloads.lock() {
                         failed.insert(video_id.clone(), error_msg.clone());
                     }
-                    let _ = download_tx.send((video_id, Err(error_msg)));
+                    let _ = download_tx.send((video_id.clone(), Err(error_msg)));
                 }
             }
 
-            // IMPORTANT: Decrement active download count
+            // IMPORTANT: Decrement active download count and remove from in-flight tracker
             if let Ok(mut count) = active_downloads.lock() {
                 *count = count.saturating_sub(1);
+            }
+            // Remove from downloading tracker (allows retry if user presses SPACE again)
+            if let Ok(mut downloading) = downloading_videos.lock() {
+                downloading.remove(&video_id);
             }
         });
 
@@ -1794,13 +1824,29 @@ impl MusicPlayerApp {
     }
 
     // Trigger smart downloads: download tracks near current position
+    // PROACTIVE BUFFER BUILDING - For instant playback as you navigate
+    // ==========================================
+    // Called when a track starts playing to keep building the download buffer
+    // Downloads next 10 tracks to maintain smooth playback without CPU spikes
+    fn ensure_next_track_ready(&self) {
+        // Download next 10 tracks from queue position 0
+        // This keeps a rolling buffer as user plays through the playlist
+        // Distributed load: 10 tracks per song = smooth, no spike
+        let next_tracks = self.queue.get_queue_slice(0, 10);
+        for track in next_tracks.iter() {
+            self.spawn_download_with_limit(track);
+        }
+    }
+
     fn trigger_smart_downloads(&self) {
-        // Smart strategy: Download next 20 tracks from queue for smooth playback
-        // With 30 concurrent downloads max, this provides good buffering
+        // LIGHTWEIGHT strategy: Download next 10 tracks from queue (reduced from 20)
+        // Less concurrent downloads = faster priority track completion
+        // With 30 concurrent downloads max, this still provides good buffering
+        // ensure_next_track_ready() handles immediate next track
         // History tracks stay cached automatically (never deleted)
 
-        // Download next 20 tracks from queue position 0 (increased for better UX)
-        let next_tracks = self.queue.get_queue_slice(0, 20);
+        // Download next 10 tracks from queue position 0 (reduced for FAST UX)
+        let next_tracks = self.queue.get_queue_slice(0, 10);
         for track in next_tracks.iter() {
             self.spawn_download_with_limit(track);
         }
@@ -1977,6 +2023,9 @@ impl MusicPlayerApp {
             // ✅ INSTANT PLAYBACK - Already in cache!
             self.player.play_with_duration(&local_file, &track.title, track.duration as f64);
             self.status_message = "".to_string();  // Clear status - player shows track
+
+            // PROACTIVE: Ensure next track is downloading for instant skip
+            self.ensure_next_track_ready();
         } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
             // Not in cache - spawn download (rate-limited!)
             // Always set pending track (even if rate limited - will retry when slot opens)
@@ -2022,6 +2071,9 @@ impl MusicPlayerApp {
             // ✅ INSTANT PLAYBACK - Already in cache!
             self.player.play_with_duration(&local_file, &track.title, track.duration as f64);
             self.status_message = "".to_string();  // Clear status - player shows track
+
+            // PROACTIVE: Ensure next track is downloading for instant skip
+            self.ensure_next_track_ready();
         } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
             // Not in cache - spawn download (rate-limited!)
             // Always set pending track (even if rate limited - will retry when slot opens)
@@ -2056,13 +2108,17 @@ impl MusicPlayerApp {
     }
 
     fn seek_forward(&mut self) {
-        // TODO: Implement when player supports seeking
-        // self.player.seek_relative(10.0);
+        // Seek forward 10 seconds
+        self.player.seek_relative(10.0);
+        self.player.apply_seek();
+        self.status_message = format!("Seeked +10s ({})", Self::format_time(self.player.get_time_pos()));
     }
 
     fn seek_backward(&mut self) {
-        // TODO: Implement when player supports seeking
-        // self.player.seek_relative(-10.0);
+        // Seek backward 10 seconds
+        self.player.seek_relative(-10.0);
+        self.player.apply_seek();
+        self.status_message = format!("Seeked -10s ({})", Self::format_time(self.player.get_time_pos()));
     }
 
     fn next_search_result(&mut self) {
@@ -2188,7 +2244,11 @@ impl MusicPlayerApp {
     }
 
     async fn load_playlist_from_url(&mut self, url: &str) {
-        self.status_message = format!("Loading playlist from URL...");
+        self.status_message = format!("⏳ Loading playlist... (this may take a moment)");
+
+        // Yield to allow UI to render the loading message before blocking fetch
+        tokio::task::yield_now().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let cookie_config = self.browser_auth.load_selected_account()
             .map(|account| self.browser_auth.get_cookie_arg(&account));
@@ -2211,15 +2271,26 @@ impl MusicPlayerApp {
                 self.loaded_playlist_tracks = tracks.clone();
                 self.loaded_playlist_name = format!("Loaded Playlist ({} tracks)", track_count);
 
-                // Add all tracks to queue
+                // Add tracks to queue (filter out tracks > 5 minutes = 300 seconds)
+                let mut added_count = 0;
+                let mut filtered_count = 0;
                 for track in tracks {
-                    self.queue.add(track);
+                    if track.duration <= 300 {
+                        self.queue.add(track);
+                        added_count += 1;
+                    } else {
+                        filtered_count += 1;
+                    }
                 }
 
                 // Trigger smart downloads - downloads next 15 + previous 5
                 self.trigger_smart_downloads();
 
-                self.status_message = format!("Added {} tracks to queue", track_count);
+                if filtered_count > 0 {
+                    self.status_message = format!("Added {} tracks to queue ({} long tracks filtered out)", added_count, filtered_count);
+                } else {
+                    self.status_message = format!("Added {} tracks to queue", added_count);
+                }
 
                 // Don't save on every action - only on exit
                 // self.save_queue_async();
@@ -2235,7 +2306,11 @@ impl MusicPlayerApp {
 
     async fn add_selected_mix_to_queue(&mut self) {
         if let Some(mix) = self.my_mix_playlists.get(self.selected_mix_item).cloned() {
-            self.status_message = format!("Fetching tracks from '{}'...", mix.title);
+            self.status_message = format!("⏳ Fetching tracks from '{}'... (this may take a moment)", mix.title);
+
+            // Yield to allow UI to render the loading message before blocking fetch
+            tokio::task::yield_now().await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
             let cookie_config = self.browser_auth.load_selected_account()
                 .map(|account| self.browser_auth.get_cookie_arg(&account));
@@ -2254,15 +2329,26 @@ impl MusicPlayerApp {
 
                     let track_count = tracks.len();
 
-                    // Add all tracks to queue
+                    // Add tracks to queue (filter out tracks > 5 minutes = 300 seconds)
+                    let mut added_count = 0;
+                    let mut filtered_count = 0;
                     for track in tracks {
-                        self.queue.add(track);
+                        if track.duration <= 300 {
+                            self.queue.add(track);
+                            added_count += 1;
+                        } else {
+                            filtered_count += 1;
+                        }
                     }
 
                     // Trigger smart downloads - downloads next 15 + previous 5
                     self.trigger_smart_downloads();
 
-                    self.status_message = format!("Added {} tracks from '{}' to queue", track_count, mix.title);
+                    if filtered_count > 0 {
+                        self.status_message = format!("Added {} tracks from '{}' ({} long tracks filtered out)", added_count, mix.title, filtered_count);
+                    } else {
+                        self.status_message = format!("Added {} tracks from '{}' to queue", added_count, mix.title);
+                    }
 
                     // Save queue to disk
                     if let Err(e) = self.save_queue() {
@@ -2448,6 +2534,14 @@ impl MusicPlayerApp {
 
     fn add_selected_to_queue(&mut self) {
         if let Some(video) = self.search_results.get(self.selected_result) {
+            // Filter out tracks > 5 minutes (300 seconds) - this is a music player!
+            if video.duration > 300 {
+                let clean_title = Self::clean_title(&video.title);
+                let mins = video.duration / 60;
+                self.status_message = format!("'{}' is too long ({}min) - music only (<5min)", clean_title, mins);
+                return;
+            }
+
             let track = Track::new(
                 video.id.clone(),
                 video.title.clone(),

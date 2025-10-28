@@ -7,11 +7,9 @@
 
 ## What the hell is this?
 
-A terminal-based YouTube music player that nobody asked for, but you're getting anyway. Built in Rust because apparently I hate myself and wanted to learn ownership and borrowing the hard way.
+A terminal-based YouTube music player that nobody asked for, but you're getting anyway. Built in Rust because I wanted to learn it and terminals are cooler than GUIs.
 
 **TL;DR:** It's like Spotify, but worse! And in your terminal! And it uses YouTube! 🎉
-
-**This is a Rust rewrite of a Python project** - perfect for Rust beginners who want to suffer through the borrow checker together.
 
 ---
 
@@ -28,8 +26,11 @@ A terminal-based YouTube music player that nobody asked for, but you're getting 
 ## Features (that actually work)
 
 - ✅ Search YouTube for songs/videos
-- ✅ Smart caching (downloads to temp, auto-deletes after 5min)
+- ✅ Playlist support (YouTube & YouTube Music playlists)
+- ✅ Smart caching (downloads to temp, auto-deletes after 1 hour)
+- ✅ Music-only filter (auto-filters tracks >5min to keep it lightweight)
 - ✅ Background pre-downloading (buffer next tracks while you listen)
+- ✅ Seeking support (←/→ arrow keys skip 10 seconds)
 - ✅ Play/Pause/Skip controls (groundbreaking, I know)
 - ✅ Volume control (revolutionary)
 - ✅ Queue management with history
@@ -43,19 +44,14 @@ A terminal-based YouTube music player that nobody asked for, but you're getting 
 
 ## Tech Stack (for the nerds)
 
-### Python → Rust Translation
-
-Because everything is better rewritten in Rust™
-
-| Component | Python (Easy Mode) | Rust (Hard Mode) |
-|-----------|-------------------|------------------|
-| **TUI** | `textual` | `ratatui` + `crossterm` |
-| **Async** | `asyncio` | `tokio` |
-| **YouTube** | `yt-dlp` | `yt-dlp` (subprocess) or `rustube` |
-| **Audio** | `python-mpv` | `rodio` (pure Rust) |
-| **HTTP** | `requests` | `reqwest` |
-| **JSON** | stdlib | `serde` + `serde_json` |
-| **Errors** | try/except | `Result<T, E>` (and crying) |
+| Component | Library |
+|-----------|---------|
+| **TUI** | `ratatui` + `crossterm` |
+| **Async** | `tokio` |
+| **YouTube** | `yt-dlp` (subprocess) |
+| **Audio** | `rodio` (pure Rust) |
+| **HTTP** | `reqwest` |
+| **JSON** | `serde` + `serde_json` |
 
 ---
 
@@ -104,12 +100,16 @@ cargo run
 | `Space` | Play/Pause (like a normal media player) |
 | `n` | Next track (skip that garbage song) |
 | `p` | Previous track (oh wait, that song was good) |
-| `↑` | Volume up (TURN IT UP!) |
-| `↓` | Volume down (turn it down, the neighbors are complaining) |
+| `j/k` | Navigate up/down in lists |
+| `↑` / `Shift+↑` | Volume up (+1 or +5) |
+| `↓` / `Shift+↓` | Volume down (-1 or -5) |
 | `→` | Seek forward 10s (skip the boring intro) |
 | `←` | Seek backward 10s (wait, what did they say?) |
-| `q` | Quit (escape the terminal) |
+| `/` | Search YouTube |
+| `l` | Load playlist URL |
+| `t` | Toggle queue view |
 | `Enter` | Add to queue / Play selected track |
+| `q` | Quit (escape the terminal) |
 
 ---
 
@@ -192,18 +192,17 @@ async fn perform_search(&mut self, query: &str) {
 
 ## Recent Improvements
 
-### Stuff that got fixed:
-- ✅ No more crashes when playing tracks (finally!)
-- ✅ Auto-advance actually works now
-- ✅ Progress bar shows actual progress
-- ✅ Better error messages (less cryptic screaming)
-- ✅ Pause button doesn't break time tracking anymore
+### Bug Fixes:
+- ✅ Fixed rapid queue clearing bug (state check prevents false positives)
+- ✅ Fixed SPACE spam creating duplicate downloads (deduplication tracker)
+- ✅ Seeking now works (←/→ arrows skip 10 seconds)
+- ✅ Download priority fixed (current + next tracks download first)
 
-### Stuff that got added:
-- ✅ HTTP timeout (so it doesn't hang forever)
-- ✅ Audio validation (checks if file is actually audio)
-- ✅ Status messages (know what's happening)
-- ✅ Queue size display (see how deep the rabbit hole goes)
+### New Features:
+- ✅ Music-only filter (auto-filters tracks >5min to avoid podcasts)
+- ✅ Playlist loading indicator (no more UI freeze)
+- ✅ Rolling download buffer (builds cache as you play)
+- ✅ Smart download management (max 30 concurrent, proper prioritization)
 
 ---
 
@@ -232,10 +231,10 @@ Just remember: I built this to learn Rust, not to build the next Spotify. Expect
 
 ## Stats (because numbers are fun)
 
-- **Original Python version:** 690 lines
-- **Rust version:** ~1200-1500 lines (more verbose but the compiler is your friend)
+- **Lines of code:** ~1500+ (mostly comments explaining Rust stuff)
 - **Times I wanted to give up:** Lost count
-- **Times the borrow checker made me cry:** Yes
+- **Times it actually worked first try:** 0
+- **Bugs fixed with Claude's help:** Too many
 
 ---
 

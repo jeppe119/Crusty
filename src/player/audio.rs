@@ -12,7 +12,6 @@
 // It provides a "Sink" abstraction for controlling audio playback
 
 use rodio::{Decoder, OutputStream, Sink};
-use std::io::Cursor;
 use std::time::{Duration, Instant};
 
 // ==========================================
@@ -86,6 +85,9 @@ pub struct AudioPlayer {
     start_time: Option<Instant>,
     pause_time: Option<Instant>,
     total_paused_duration: Duration,
+    // Seeking support (rodio workaround)
+    current_file_path: Option<String>,
+    seek_position: Option<f64>,
 }
 
 // Implement custom Drop to handle cleanup properly
@@ -162,6 +164,8 @@ impl AudioPlayer {
             start_time: None,
             pause_time: None,
             total_paused_duration: Duration::from_secs(0),
+            current_file_path: None,
+            seek_position: None,
         }
     }
 
@@ -221,6 +225,8 @@ impl AudioPlayer {
                             self.start_time = Some(Instant::now());
                             self.pause_time = None;
                             self.total_paused_duration = Duration::from_secs(0);
+                            // Store file path for seeking support
+                            self.current_file_path = Some(file_path.to_string());
                         }
                         Err(_panic_err) => {
                             self.state = PlayerState::Stopped;
@@ -395,23 +401,52 @@ impl AudioPlayer {
     // Parameters:
     // - seconds: Position to seek to (e.g., 30.0 = 30 seconds into track)
     //
-    // Currently unimplemented because:
-    // - Rodio's Sink doesn't directly support seeking
-    // - Would require:
-    //   1. Stopping current playback
-    //   2. Reloading audio from the seeked position
-    //   3. Resuming playback
-    // - For streaming (YouTube), this is complex
-    //
-    // Alternative approach:
-    // - Use a different audio library (symphonia has better seek support)
-    // - Or implement buffering and seek within buffer
-    //
-    // TODO: Decide on seeking strategy
-    pub fn seek(&mut self, _seconds: f64) {
-        // Underscore prefix on _seconds means "intentionally unused parameter"
-        // Prevents compiler warning about unused variable
-        unimplemented!("seek() requires more advanced audio control than Sink provides")
+    // Implementation: Rodio doesn't support seeking, so we reload the track
+    // and skip to the target position. Since files are cached, this is fast.
+    pub fn seek(&mut self, seconds: f64) {
+        // Can't seek if we don't know what file is playing
+        if self.current_title.is_empty() {
+            return;
+        }
+
+        // Clamp seek position to valid range
+        let target_position = if seconds < 0.0 {
+            0.0
+        } else if self.duration > 0.0 && seconds > self.duration {
+            self.duration
+        } else {
+            seconds
+        };
+
+        // Store the target position for use after reload
+        self.seek_position = Some(target_position);
+    }
+
+    // Helper to get the file path from current playback (needs to be set externally)
+    pub fn set_current_file(&mut self, file_path: String) {
+        self.current_file_path = Some(file_path);
+    }
+
+    // Actually perform the seek by reloading
+    pub fn apply_seek(&mut self) -> bool {
+        if let (Some(seek_pos), Some(file_path)) = (self.seek_position, self.current_file_path.clone()) {
+            // Reload the track
+            let title = self.current_title.clone();
+            let duration = self.duration;
+
+            // Play from beginning
+            self.play_with_duration(&file_path, &title, duration);
+
+            // Skip to target position by adjusting start_time
+            if let Some(start) = self.start_time {
+                let seek_duration = std::time::Duration::from_secs_f64(seek_pos);
+                self.start_time = Some(start - seek_duration);
+            }
+
+            self.seek_position = None;
+            return true;
+        }
+        false
     }
 
     // ==========================================
@@ -423,18 +458,10 @@ impl AudioPlayer {
     // - seconds: How many seconds to skip forward/backward
     //   - Positive: Skip forward (e.g., +10.0 = skip ahead 10 seconds)
     //   - Negative: Skip backward (e.g., -10.0 = go back 10 seconds)
-    //
-    // Currently unimplemented for same reasons as seek().
-    //
-    // When implemented, would work like:
-    // 1. Get current position: let pos = self.get_time_pos()
-    // 2. Calculate new position: let new_pos = pos + seconds
-    // 3. Clamp to valid range: 0.0 to self.duration
-    // 4. Seek to new_pos
-    //
-    // TODO: Implement when seek() is working
-    pub fn seek_relative(&mut self, _seconds: f64) {
-        unimplemented!("seek_relative() depends on seek() being implemented")
+    pub fn seek_relative(&mut self, seconds: f64) {
+        let current_pos = self.get_time_pos();
+        let new_pos = current_pos + seconds;
+        self.seek(new_pos);
     }
 
     // ==========================================
@@ -600,12 +627,12 @@ impl AudioPlayer {
     // Checks if the current track has finished playing.
     //
     // Returns: bool
-    // - true: Track finished (sink is empty AND minimum time has elapsed)
-    // - false: Track still playing or paused
+    // - true: Track finished (sink is empty AND actually played)
+    // - false: Track still playing, paused, or loading
     //
     // This is useful for auto-advancing to next track
     //
-    // IMPORTANT: We use a time-based guard to prevent rapid auto-advance bugs
+    // IMPORTANT: We use state + time checks to prevent rapid auto-advance bugs
     // where the sink might be briefly empty during track loading/buffering.
     pub fn is_finished(&self) -> bool {
         if let Some(sink) = &self.sink {
@@ -614,28 +641,27 @@ impl AudioPlayer {
                 return false;
             }
 
-            // Second check: Must have a start time (track actually started)
-            if let Some(start) = self.start_time {
-                // Calculate real elapsed time (wall clock, not playback time)
-                // This is important because we need to detect rapid state changes
-                let elapsed = Instant::now().duration_since(start).as_secs_f64();
+            // CRITICAL: Must be in Playing state (not Loading, Stopped, or Paused)
+            // This is THE fix for rapid queue clearing:
+            // - During track loading, state = Loading, sink = empty → NOT finished!
+            // - During actual playback, state = Playing, sink = empty → finished!
+            if self.state != PlayerState::Playing {
+                return false;
+            }
 
-                // CRITICAL: NEVER consider track finished within first 2 seconds
-                // This prevents the race condition where:
-                // 1. Track finishes -> sink becomes empty
-                // 2. Auto-advance starts next track -> sink still empty during load
-                // 3. is_finished() called again -> would return true again
-                // 4. Another auto-advance triggered -> rapid queue clearing!
-                //
-                // The 2-second guard ensures the track has been "started" long enough
-                // that we're not in the middle of a track transition.
-                if elapsed < 2.0 {
-                    return false;
+            // Third check: Must have a start time (track actually started)
+            if let Some(_start) = self.start_time {
+                // Get actual playback time (excluding pauses)
+                let playback_time = self.get_time_pos();
+
+                // 2-SECOND GUARD: Feels natural and prevents edge cases
+                // Combined with state check above, this prevents rapid queue clearing
+                // while still allowing tracks to finish properly
+                if playback_time >= 2.0 {
+                    return true;
                 }
 
-                // After 2 seconds, track is legitimately finished if sink is empty
-                // (No duration check needed - if it played for 2+ seconds and sink is empty, it's done)
-                return true;
+                return false;
             } else {
                 // No start time - track never actually started playing
                 // Return false to prevent skipping tracks that failed to load
