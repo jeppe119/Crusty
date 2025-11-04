@@ -1024,9 +1024,22 @@ impl MusicPlayerApp {
 
             // Scroll text if too long (more than 80 chars)
             if full_text.len() > 80 {
-                let scroll_pos = self.title_scroll_offset % full_text.len();
+                let raw_scroll_pos = self.title_scroll_offset % full_text.len();
+                // Ensure we slice at a valid UTF-8 character boundary
+                // Find the nearest valid char boundary at or before raw_scroll_pos
+                let mut scroll_pos = raw_scroll_pos;
+                while scroll_pos > 0 && !full_text.is_char_boundary(scroll_pos) {
+                    scroll_pos -= 1;
+                }
                 let rotated = format!("{}   {}", &full_text[scroll_pos..], &full_text[..scroll_pos]);
-                format!("Now Playing: {}", &rotated[..80.min(rotated.len())])
+
+                // Also ensure the final slice is at a char boundary
+                let max_len = 80.min(rotated.len());
+                let mut end_pos = max_len;
+                while end_pos > 0 && !rotated.is_char_boundary(end_pos) {
+                    end_pos -= 1;
+                }
+                format!("Now Playing: {}", &rotated[..end_pos])
             } else {
                 format!("Now Playing: {}", full_text)
             }
