@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="Crusty.png" alt="Crusty" width="250" />
+  <img src="assets/Crusty.png" alt="Crusty" width="250" />
   <p><i>A terminal-based YouTube music player written in Rust</i></p>
 </div>
 
@@ -14,22 +14,22 @@ A terminal YouTube music player built in Rust as a learning project. It uses `yt
 ## Screenshots
 
 <div align="center">
-  <img src="screenshots_login.png" alt="Login prompt" width="700" />
+  <img src="assets/screenshots/screenshots_login.png" alt="Login prompt" width="700" />
   <p><i>Browser account selection</i></p>
 </div>
 
 <div align="center">
-  <img src="screenshots_home.png" alt="Home screen" width="700" />
+  <img src="assets/screenshots/screenshots_home.png" alt="Home screen" width="700" />
   <p><i>Home screen after login</i></p>
 </div>
 
 <div align="center">
-  <img src="screenshots_playlist.png" alt="Playlist loaded" width="700" />
+  <img src="assets/screenshots/screenshots_playlist.png" alt="Playlist loaded" width="700" />
   <p><i>Playlist loaded with tracks queued</i></p>
 </div>
 
 <div align="center">
-  <img src="screenshots_playing.png" alt="Music playing" width="700" />
+  <img src="assets/screenshots/screenshots_playing.png" alt="Music playing" width="700" />
   <p><i>Music playing with history</i></p>
 </div>
 
@@ -120,8 +120,12 @@ cargo run
 Crusty/
 ├── Cargo.toml
 ├── README.md
-├── Crusty.png
-├── Crusty2.png
+├── assets/
+│   ├── Crusty.png
+│   └── screenshots/
+├── docs/
+│   ├── RUST_CHEATSHEET.md
+│   └── TODO.md
 └── src/
     ├── main.rs
     │
