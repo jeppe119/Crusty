@@ -216,38 +216,6 @@ impl Queue {
     }
 
     // ==========================================
-    // ADDING TRACKS: add_multiple()
-    // ==========================================
-    // Adds multiple tracks to the queue at once.
-    //
-    // Parameters:
-    // - tracks: Vec<Track> - A vector of tracks to add
-    //
-    // What happens:
-    // - Iterates through the vector
-    // - Adds each track to the queue in order
-    // - Order is preserved: tracks[0] plays before tracks[1], etc.
-    //
-    // Example:
-    // - Queue: [A]
-    // - add_multiple(vec![B, C, D])
-    // - Queue: [A, B, C, D]
-    //
-    // Why take Vec<Track> instead of &[Track]?
-    // - We consume/move the tracks (don't need to keep original)
-    // - Avoids cloning if caller doesn't need tracks afterward
-    // - More efficient for large batches
-    //
-    // Alternative implementation could use extend():
-    // - self.tracks.extend(tracks);
-    // But current implementation is clearer for learning
-    pub fn add_multiple(&mut self, tracks: Vec<Track>) {
-        for track in tracks {
-            self.add(track);
-        }
-    }
-
-    // ==========================================
     // NAVIGATION: next()
     // ==========================================
     // Moves to the next track in the queue.
@@ -369,75 +337,6 @@ impl Queue {
         // Step 4: No history available (we're at the beginning)
         self.current_track = None;
         None
-    }
-
-    // ==========================================
-    // QUEUE MANAGEMENT: clear()
-    // ==========================================
-    // Clears all tracks from the queue.
-    //
-    // What happens:
-    // - Removes all tracks waiting to be played
-    // - Does NOT clear history (past tracks remain)
-    // - Does NOT stop current track (use player.stop() for that)
-    // - After this, queue is empty but history and current_track unchanged
-    //
-    // Use case:
-    // - User wants to start fresh queue
-    // - Remove all pending tracks without affecting what's playing
-    //
-    // Example:
-    // - Before: Queue=[A, B, C], Current=D, History=[E]
-    // - clear()
-    // - After: Queue=[], Current=D, History=[E]
-    pub fn clear(&mut self) {
-        self.tracks.clear();
-    }
-
-    // ==========================================
-    // QUEUE MANAGEMENT: remove()
-    // ==========================================
-    // Removes a specific track from the queue by index.
-    //
-    // Parameters:
-    // - index: The position in the queue (0 = next to play, 1 = after that, etc.)
-    //
-    // Returns: bool
-    // - true: Track was successfully removed
-    // - false: Index was out of bounds (no track at that position)
-    //
-    // What happens:
-    // 1. Check if index is valid (< queue length)
-    // 2. If valid: Remove track at that index
-    // 3. Return true if removed, false if index invalid
-    //
-    // Why return bool instead of Option<Track>?
-    // - Caller usually doesn't need the removed track
-    // - Just needs to know if removal succeeded
-    // - Could be changed to return Option<Track> for more info
-    //
-    // Example:
-    // - Queue: [A, B, C, D]
-    // - remove(1) → Removes B
-    // - Queue: [A, C, D]
-    // - Returns: true
-    //
-    // - remove(10) → Index out of bounds
-    // - Queue: [A, C, D] (unchanged)
-    // - Returns: false
-    //
-    // Note: VecDeque.remove(index) is O(n) complexity
-    // - For large queues, this could be slow
-    // - But music queues are usually small (<100 tracks)
-    pub fn remove(&mut self, index: usize) -> bool {
-        // Check if index is within valid range
-        if index < self.tracks.len() {
-            // Valid index, remove the track
-            self.tracks.remove(index);
-            return true;
-        }
-        // Invalid index, can't remove
-        false
     }
 
     // ==========================================
@@ -596,42 +495,6 @@ impl Queue {
     // - size() returns 3 (only counts A, B, C)
     pub fn size(&self) -> usize {
         self.tracks.len()
-    }
-
-    // ==========================================
-    // QUEUE INSPECTION: peek()
-    // ==========================================
-    // Looks at the next track without removing it.
-    //
-    // Returns: Option<&Track>
-    // - Some(&track): Reference to the next track in queue
-    // - None: Queue is empty
-    //
-    // Why return a reference (&Track) instead of clone?
-    // - More efficient (no cloning needed)
-    // - Caller only needs to read, not own
-    // - Common pattern for "peeking" at data
-    //
-    // Why Option?
-    // - Queue might be empty (no next track)
-    // - Forces caller to handle empty case
-    //
-    // Use cases:
-    // - Display "Up Next: Song Name" in UI
-    // - Check what's coming without affecting queue
-    // - Preload next track in background
-    //
-    // Example:
-    // - Queue: [A, B, C]
-    // - peek() returns Some(&A)
-    // - Queue still: [A, B, C] (unchanged!)
-    //
-    // - Queue: []
-    // - peek() returns None
-    pub fn peek(&self) -> Option<&Track> {
-        // .front() returns reference to first element
-        // Returns Option<&Track>: Some(&track) or None
-        self.tracks.front()
     }
 
     // ==========================================

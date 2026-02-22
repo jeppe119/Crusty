@@ -4,7 +4,7 @@
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Gauge},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame, Terminal,
     style::{Color, Modifier, Style},
 };
@@ -40,7 +40,7 @@ enum ViewMode {
 
 #[derive(Debug, Clone)]
 struct MixPlaylist {
-    id: String,
+    _id: String,
     title: String,
     track_count: usize,
     url: String,
@@ -55,7 +55,7 @@ struct QueueState {
 pub struct MusicPlayerApp {
     player: AudioPlayer,
     queue: Queue,
-    extractor: YouTubeExtractor,
+    _extractor: YouTubeExtractor,
     browser_auth: BrowserAuth,
     available_accounts: Vec<BrowserAccount>,
     selected_account_idx: usize,
@@ -158,7 +158,7 @@ impl MusicPlayerApp {
         MusicPlayerApp {
             player: AudioPlayer::new(),
             queue,
-            extractor: YouTubeExtractor::new(),
+            _extractor: YouTubeExtractor::new(),
             browser_auth,
             available_accounts: Vec::new(),
             selected_account_idx: 0,
@@ -213,34 +213,6 @@ impl MusicPlayerApp {
         }
     }
 
-    // Get bouncing playback visualization
-    fn get_playback_visualization(&self, progress_ratio: u16) -> String {
-        // Bouncing bars animation when music is playing
-        let frame = (self.animation_frame / 4) % 8;  // Faster bounce
-
-        // Create bouncing bar heights
-        let bars = match frame {
-            0 => "▁▂▃▄▅▆▇█",
-            1 => "▂▃▄▅▆▇█▇",
-            2 => "▃▄▅▆▇█▇▆",
-            3 => "▄▅▆▇█▇▆▅",
-            4 => "▅▆▇█▇▆▅▄",
-            5 => "▆▇█▇▆▅▄▃",
-            6 => "▇█▇▆▅▄▃▂",
-            7 => "█▇▆▅▄▃▂▁",
-            _ => "▄▄▄▄▄▄▄▄",
-        };
-
-        let time_pos = self.player.get_time_pos();
-        let duration = self.player.get_duration();
-
-        if duration > 0.0 {
-            format!("{} {}/{}", bars, Self::format_time(time_pos), Self::format_time(duration))
-        } else {
-            format!("{} Playing...", bars)
-        }
-    }
-
     fn load_history() -> Result<Vec<Track>, Box<dyn std::error::Error>> {
         use std::fs;
 
@@ -279,28 +251,6 @@ impl MusicPlayerApp {
         fs::write(history_file, json)?;
 
         Ok(())
-    }
-
-    fn load_queue() -> Result<QueueState, Box<dyn std::error::Error>> {
-        use std::fs;
-
-        let config_dir = dirs::config_dir()
-            .ok_or("Could not find config directory")?
-            .join("youtube-music-player");
-
-        let queue_file = config_dir.join("queue.json");
-
-        if !queue_file.exists() {
-            return Ok(QueueState {
-                tracks: Vec::new(),
-                current_track: None,
-            });
-        }
-
-        let contents = fs::read_to_string(queue_file)?;
-        let queue_state: QueueState = serde_json::from_str(&contents)?;
-
-        Ok(queue_state)
     }
 
     fn save_queue(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -417,43 +367,6 @@ impl MusicPlayerApp {
                 self.queue_loaded = true;
             }
         }
-    }
-
-    // Async version that doesn't block the UI
-    fn save_queue_async(&self) {
-        // Clone the data we need
-        let queue_state = QueueState {
-            tracks: self.queue.get_queue_list(),
-            current_track: self.queue.get_current().cloned(),
-        };
-
-        // Spawn blocking task to save in background
-        tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                use std::fs;
-
-                let config_dir = dirs::config_dir()
-                    .ok_or("Could not find config directory")?
-                    .join("youtube-music-player");
-
-                fs::create_dir_all(&config_dir)
-                    .map_err(|e| format!("Failed to create config dir: {}", e))?;
-
-                let queue_file = config_dir.join("queue.json");
-                let json = serde_json::to_string_pretty(&queue_state)
-                    .map_err(|e| format!("Failed to serialize queue: {}", e))?;
-                fs::write(queue_file, json)
-                    .map_err(|e| format!("Failed to write queue file: {}", e))?;
-
-                Ok(())
-            }).await;
-
-            match result {
-                Ok(Ok(())) => {}, // Success
-                Ok(Err(e)) => eprintln!("Failed to save queue: {}", e),
-                Err(e) => eprintln!("Task error while saving queue: {}", e),
-            }
-        });
     }
 
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1065,14 +978,14 @@ impl MusicPlayerApp {
             0.0
         };
 
-        let progress_ratio = if duration > 0.0 {
+        let _progress_ratio = if duration > 0.0 {
             (time_pos / duration * 100.0).min(100.0) as u16
         } else {
             0
         };
 
         // Build progress bar string with bouncing bars
-        let progress_visual = if self.player.get_state() == PlayerState::Playing {
+        let _progress_visual = if self.player.get_state() == PlayerState::Playing {
             // Always show bouncing bars when playing
             let frame = (self.animation_frame / 4) % 8;
             let bars = match frame {
@@ -1172,208 +1085,6 @@ impl MusicPlayerApp {
             .alignment(Alignment::Center);
 
         frame.render_widget(cache_widget, area);
-    }
-
-    fn draw_player_unified(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        // Unified Player: Combines player info, playback progress, and cache stats
-        let current_track = self.queue.get_current();
-        let now_playing = if let Some(track) = current_track {
-            let clean_title = Self::clean_title(&track.title);
-            format!("Now Playing: {} - {}", clean_title, track.uploader)
-        } else {
-            "No track playing".to_string()
-        };
-
-        let state_str = match self.player.get_state() {
-            PlayerState::Playing => "▶ Playing",
-            PlayerState::Paused => "⏸ Paused",
-            PlayerState::Stopped => "⏹ Stopped",
-            PlayerState::Loading => "... Loading",
-        };
-
-        let volume = self.player.get_volume();
-        let time_pos = self.player.get_time_pos();
-        let duration = self.player.get_duration();
-
-        // Get download stats
-        let active_count = self.active_downloads.lock().ok().map(|c| *c).unwrap_or(0);
-        let cached_count = self.downloaded_files.lock().ok().map(|f| f.len()).unwrap_or(0);
-
-        // Build unified info
-        let download_status = if active_count > 0 {
-            format!("{} ⬇ {} | 💾 {}", self.get_download_animation(), active_count, cached_count)
-        } else {
-            format!("💾 {} cached", cached_count)
-        };
-
-        // Playback visualization
-        let progress_ratio = if duration > 0.0 {
-            (time_pos / duration * 100.0).min(100.0) as u16
-        } else {
-            0
-        };
-
-        let playback_visual = if self.player.get_state() == PlayerState::Playing && duration > 0.0 {
-            format!("{} {}/{}",
-                self.get_playback_visualization(progress_ratio).split_whitespace().next().unwrap_or("▄▄▄▄▄▄▄▄"),
-                Self::format_time(time_pos),
-                Self::format_time(duration))
-        } else if duration > 0.0 {
-            format!("{}/{}", Self::format_time(time_pos), Self::format_time(duration))
-        } else {
-            "00:00".to_string()
-        };
-
-        let unified_info = format!(
-            "{}\n{} | Vol: {}% | {} | Queue: {} | {}",
-            now_playing,
-            state_str,
-            volume,
-            playback_visual,
-            self.queue.size(),
-            download_status
-        );
-
-        let player_widget = Paragraph::new(unified_info)
-            .block(Block::default().borders(Borders::ALL).title("Player"))
-            .style(Style::default().fg(Color::Cyan));
-
-        frame.render_widget(player_widget, area);
-    }
-
-    fn draw_player_bar(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        // Split the player bar into info section and progress bar (smaller!)
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(4),  // Info section
-                Constraint::Length(2),  // Progress bar (reduced from 3)
-            ])
-            .split(area);
-
-        let current_track = self.queue.get_current();
-        let now_playing = if let Some(track) = current_track {
-            let clean_title = Self::clean_title(&track.title);
-            format!("Now Playing: {} - {}", clean_title, track.uploader)
-        } else {
-            "No track playing".to_string()
-        };
-
-        let state_str = match self.player.get_state() {
-            PlayerState::Playing => "▶ Playing",
-            PlayerState::Paused => "⏸ Paused",
-            PlayerState::Stopped => "⏹ Stopped",
-            PlayerState::Loading => "... Loading",
-        };
-
-        let volume = self.player.get_volume();
-        let time_pos = self.player.get_time_pos();
-        let duration = self.player.get_duration();
-        let time_str = if duration > 0.0 {
-            format!("{} / {}", Self::format_time(time_pos), Self::format_time(duration))
-        } else {
-            Self::format_time(time_pos)
-        };
-
-        let player_info = format!(
-            "{}\nState: {} | Volume: {}% | Time: {} | Queue: {} tracks remaining",
-            now_playing,
-            state_str,
-            volume,
-            time_str,
-            self.queue.size()
-        );
-
-        let player_widget = Paragraph::new(player_info)
-            .block(Block::default().borders(Borders::ALL).title("Player"));
-        frame.render_widget(player_widget, chunks[0]);
-
-        // Progress bar
-        let progress_ratio = if duration > 0.0 {
-            (time_pos / duration * 100.0).min(100.0) as u16
-        } else {
-            0
-        };
-
-        let progress_label = if duration > 0.0 {
-            // Show playback progress
-            let active_count = self.active_downloads.lock().ok().map(|c| *c).unwrap_or(0);
-            let cached_count = self.downloaded_files.lock().ok().map(|f| f.len()).unwrap_or(0);
-            if active_count > 0 {
-                format!("{} / {} | {} {} downloading, {} cached",
-                    Self::format_time(time_pos), Self::format_time(duration),
-                    self.get_download_animation(), active_count, cached_count)
-            } else if cached_count > 0 {
-                format!("{} / {} | {} cached",
-                    Self::format_time(time_pos), Self::format_time(duration), cached_count)
-            } else {
-                format!("{} / {}", Self::format_time(time_pos), Self::format_time(duration))
-            }
-        } else if let Some(downloading) = &self.currently_downloading {
-            let active_count = self.active_downloads.lock().ok().map(|c| *c).unwrap_or(0);
-            let cached_count = self.downloaded_files.lock().ok().map(|f| f.len()).unwrap_or(0);
-            if active_count > 1 {
-                format!("{} Downloading {} tracks ({} cached)", self.get_download_animation(), active_count, cached_count)
-            } else {
-                format!("{} Downloading: {} ({} cached)", self.get_download_animation(), downloading, cached_count)
-            }
-        } else {
-            // No track loaded - but show download activity if present
-            let active_count = self.active_downloads.lock().ok().map(|c| *c).unwrap_or(0);
-            let cached_count = self.downloaded_files.lock().ok().map(|f| f.len()).unwrap_or(0);
-
-            if active_count > 0 {
-                format!("{} Downloading {} tracks | {} cached", self.get_download_animation(), active_count, cached_count)
-            } else if cached_count > 0 {
-                format!("No track loaded | {} cached", cached_count)
-            } else {
-                "No track loaded".to_string()
-            }
-        };
-
-        // Split progress bar: Playback (left) | Download Stats (right)
-        let progress_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-            .split(chunks[1]);
-
-        // Left: Playback progress with bouncing visualization
-        let playback_visual = if self.player.get_state() == PlayerState::Playing {
-            // Bouncing bars when playing
-            self.get_playback_visualization(progress_ratio)
-        } else {
-            // Static bar when paused/stopped
-            progress_label.clone()
-        };
-
-        let progress_bar = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title("Playback"))
-            .gauge_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            )
-            .percent(progress_ratio)
-            .label(playback_visual);
-
-        frame.render_widget(progress_bar, progress_chunks[0]);
-
-        // Right: Download stats (compact)
-        let active_count = self.active_downloads.lock().ok().map(|c| *c).unwrap_or(0);
-        let cached_count = self.downloaded_files.lock().ok().map(|f| f.len()).unwrap_or(0);
-
-        let download_info = if active_count > 0 {
-            format!("{} ⬇ {}\n💾 {}", self.get_download_animation(), active_count, cached_count)
-        } else {
-            format!("💾 {} cached", cached_count)
-        };
-
-        let download_widget = Paragraph::new(download_info)
-            .block(Block::default().borders(Borders::ALL).title("Cache"))
-            .style(Style::default().fg(Color::Yellow))
-            .alignment(Alignment::Center);
-
-        frame.render_widget(download_widget, progress_chunks[1]);
     }
 
     async fn handle_input(&mut self, key: KeyEvent) {
@@ -2340,7 +2051,7 @@ impl MusicPlayerApp {
                         return;
                     }
 
-                    let track_count = tracks.len();
+                    let _track_count = tracks.len();
 
                     // Add tracks to queue (filter out tracks > 5 minutes = 300 seconds)
                     let mut added_count = 0;
@@ -2531,7 +2242,7 @@ impl MusicPlayerApp {
                             || title.contains("Mix")
                             || title.contains("mix") {
                             playlists.push(MixPlaylist {
-                                id: playlist_id,
+                                _id: playlist_id,
                                 title,
                                 track_count,
                                 url,

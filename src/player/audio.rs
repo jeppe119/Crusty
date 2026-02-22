@@ -182,10 +182,6 @@ impl AudioPlayer {
     //
     // Note: This is synchronous and will block briefly while downloading
     // In a real app, you'd want to do this asynchronously or in a background thread
-    pub fn play(&mut self, file_path: &str, title: &str) {
-        self.play_with_duration(file_path, title, 0.0);
-    }
-
     pub fn play_with_duration(&mut self, file_path: &str, title: &str, known_duration: f64) {
         // Only try to play if we have a sink (audio device available)
         if let Some(sink) = &self.sink {
@@ -420,11 +416,6 @@ impl AudioPlayer {
 
         // Store the target position for use after reload
         self.seek_position = Some(target_position);
-    }
-
-    // Helper to get the file path from current playback (needs to be set externally)
-    pub fn set_current_file(&mut self, file_path: String) {
-        self.current_file_path = Some(file_path);
     }
 
     // Actually perform the seek by reloading

@@ -11,6 +11,30 @@ A terminal YouTube music player built in Rust as a learning project. It uses `yt
 
 ---
 
+## Screenshots
+
+<div align="center">
+  <img src="screenshots_login.png" alt="Login prompt" width="700" />
+  <p><i>Browser account selection</i></p>
+</div>
+
+<div align="center">
+  <img src="screenshots_home.png" alt="Home screen" width="700" />
+  <p><i>Home screen after login</i></p>
+</div>
+
+<div align="center">
+  <img src="screenshots_playlist.png" alt="Playlist loaded" width="700" />
+  <p><i>Playlist loaded with tracks queued</i></p>
+</div>
+
+<div align="center">
+  <img src="screenshots_playing.png" alt="Music playing" width="700" />
+  <p><i>Music playing with history</i></p>
+</div>
+
+---
+
 ## Features
 
 - Search YouTube for songs and videos
@@ -58,11 +82,11 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ### Build
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/jeppe119/Crusty.git
 cd Crusty
 
 cargo build --release
-./target/release/youtube-music-player-rust
+./target/release/crusty
 
 # Or run in dev mode
 cargo run

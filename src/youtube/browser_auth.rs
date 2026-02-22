@@ -38,6 +38,9 @@ impl BrowserAuth {
         // Try Chrome
         accounts.extend(self.detect_chrome_accounts());
 
+        // Try Chromium
+        accounts.extend(self.detect_chromium_accounts());
+
         // Try Firefox
         accounts.extend(self.detect_firefox_accounts());
 
@@ -89,12 +92,60 @@ impl BrowserAuth {
         accounts
     }
 
+    fn detect_chromium_accounts(&self) -> Vec<BrowserAccount> {
+        let mut accounts = Vec::new();
+
+        let chromium_base = if cfg!(target_os = "linux") {
+            dirs::config_dir().map(|d| d.join("chromium"))
+        } else if cfg!(target_os = "macos") {
+            dirs::home_dir().map(|d| d.join("Library/Application Support/Chromium"))
+        } else if cfg!(target_os = "windows") {
+            dirs::data_local_dir().map(|d| d.join("Chromium/User Data"))
+        } else {
+            None
+        };
+
+        if let Some(chromium_dir) = chromium_base {
+            if chromium_dir.exists() {
+                let default_profile = chromium_dir.join("Default");
+                if default_profile.exists() {
+                    accounts.push(BrowserAccount {
+                        browser: "chromium".to_string(),
+                        profile: "Default".to_string(),
+                        email: None,
+                        display_name: "Chromium - Default Profile".to_string(),
+                    });
+                }
+
+                for i in 1..10 {
+                    let profile_dir = chromium_dir.join(format!("Profile {}", i));
+                    if profile_dir.exists() {
+                        accounts.push(BrowserAccount {
+                            browser: "chromium".to_string(),
+                            profile: format!("Profile {}", i),
+                            email: None,
+                            display_name: format!("Chromium - Profile {}", i),
+                        });
+                    }
+                }
+            }
+        }
+
+        accounts
+    }
+
     fn detect_zen_accounts(&self) -> Vec<BrowserAccount> {
         let mut accounts = Vec::new();
 
         // Zen Browser config locations (Firefox fork)
         let zen_base = if cfg!(target_os = "linux") {
-            dirs::home_dir().map(|d| d.join(".zen"))
+            // Try ~/.config/zen first (common on Arch), then ~/.zen
+            let config_path = dirs::config_dir().map(|d| d.join("zen"));
+            if config_path.as_ref().is_some_and(|p| p.exists()) {
+                config_path
+            } else {
+                dirs::home_dir().map(|d| d.join(".zen"))
+            }
         } else if cfg!(target_os = "macos") {
             dirs::home_dir().map(|d| d.join("Library/Application Support/Zen"))
         } else if cfg!(target_os = "windows") {
@@ -209,14 +260,28 @@ impl BrowserAuth {
             "firefox" => {
                 (true, format!("firefox:{}", account.profile))
             }
+            "chromium" => {
+                let arg = if account.profile == "Default" {
+                    "chromium".to_string()
+                } else {
+                    format!("chromium:{}", account.profile)
+                };
+                (true, arg)
+            }
             "zen" => {
                 // Zen Browser: treat as Firefox since it's a Firefox fork
                 // yt-dlp can extract cookies from Firefox-based browsers
                 // Pass the full profile path
                 if cfg!(target_os = "linux") {
+                    // Try ~/.config/zen first, then ~/.zen
+                    if let Some(config_dir) = dirs::config_dir() {
+                        let profile_path = config_dir.join("zen").join(&account.profile);
+                        if profile_path.exists() {
+                            return (true, format!("firefox:{}", profile_path.display()));
+                        }
+                    }
                     if let Some(home) = dirs::home_dir() {
                         let profile_path = home.join(".zen").join(&account.profile);
-                        // Use format: firefox:/path/to/profile
                         return (true, format!("firefox:{}", profile_path.display()));
                     }
                 } else if cfg!(target_os = "macos") {
