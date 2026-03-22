@@ -49,6 +49,31 @@ impl DownloadManager {
         }
     }
 
+    /// Create a new DownloadManager with a pre-warmed cache of previously downloaded files.
+    pub fn with_cache(cache: HashMap<String, String>) -> Self {
+        let (download_tx, download_rx) = mpsc::unbounded_channel();
+        Self {
+            state: Arc::new(Mutex::new(DownloadState {
+                downloaded_files: cache,
+                failed_downloads: HashMap::new(),
+                active_count: 0,
+                downloading_videos: HashSet::new(),
+            })),
+            background_tasks: Arc::new(Mutex::new(Vec::new())),
+            download_tx,
+            download_rx,
+        }
+    }
+
+    /// Returns a snapshot of the current download cache for persistence.
+    pub fn get_cache_snapshot(&self) -> HashMap<String, String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .downloaded_files
+            .clone()
+    }
+
     /// Poll for a completed download without blocking.
     /// Also prunes finished background tasks to prevent unbounded growth.
     pub fn poll_completion(&mut self) -> Option<DownloadResult> {

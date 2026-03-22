@@ -1,5 +1,6 @@
 //! Persistence service for saving and loading history and queue state.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -147,6 +148,58 @@ impl PersistenceService {
         let path = self.config_dir.join("queue.json");
         let json = serde_json::to_string_pretty(state).context("Failed to serialize queue")?;
         fs::write(&path, json).context("Failed to write queue file")?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+
+        Ok(())
+    }
+
+    // -- Download cache -------------------------------------------------
+
+    /// Load the download cache (video_id → file_path), filtering out entries
+    /// whose files no longer exist on disk.
+    pub(crate) fn load_download_cache(&self) -> HashMap<String, String> {
+        let path = self.config_dir.join("download_cache.json");
+
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return HashMap::new(),
+        };
+
+        let metadata = match file.metadata() {
+            Ok(m) if m.len() <= MAX_FILE_SIZE => m,
+            _ => return HashMap::new(),
+        };
+        let _ = metadata;
+
+        let mut contents = String::new();
+        if file.read_to_string(&mut contents).is_err() {
+            return HashMap::new();
+        }
+
+        let cache: HashMap<String, String> = match serde_json::from_str(&contents) {
+            Ok(c) => c,
+            Err(_) => return HashMap::new(),
+        };
+
+        // Only keep entries where the file still exists
+        cache
+            .into_iter()
+            .filter(|(_, path)| std::path::Path::new(path).exists())
+            .collect()
+    }
+
+    /// Save the download cache to disk.
+    pub(crate) fn save_download_cache(&self, cache: &HashMap<String, String>) -> Result<()> {
+        fs::create_dir_all(&self.config_dir).context("Failed to create config directory")?;
+
+        let path = self.config_dir.join("download_cache.json");
+        let json = serde_json::to_string(cache).context("Failed to serialize download cache")?;
+        fs::write(&path, json).context("Failed to write download cache")?;
 
         #[cfg(unix)]
         {

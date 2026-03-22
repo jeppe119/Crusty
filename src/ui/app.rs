@@ -97,11 +97,9 @@ impl MusicPlayerApp {
             queue.limit_history(crate::services::persistence::MAX_HISTORY_SIZE);
         }
 
-        // Don't load queue at startup - it blocks with large queues
-        // Will load asynchronously after UI starts
-        // if let Ok(queue_state) = Self::load_queue() {
-        //     queue.restore_queue(queue_state.tracks, queue_state.current_track);
-        // }
+        // Warm the download cache from previous session
+        let download_cache = persistence.load_download_cache();
+        let cache_count = download_cache.len();
 
         Ok(MusicPlayerApp {
             player: AudioPlayer::new(),
@@ -116,9 +114,13 @@ impl MusicPlayerApp {
             current_view: ViewMode::Home,
             previous_view: ViewMode::Home,
             should_quit: false,
-            status_message,
+            status_message: if cache_count > 0 {
+                format!("{} ({} cached)", status_message, cache_count)
+            } else {
+                status_message
+            },
             queue_loaded: false,
-            downloads: DownloadManager::new(),
+            downloads: DownloadManager::with_cache(download_cache),
             search_rx,
             search_tx,
             pending_play_track: None,
@@ -390,13 +392,18 @@ impl MusicPlayerApp {
         self.downloads.abort_all();
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Save history and queue before quitting
+        // Save history, queue, and download cache before quitting
         if let Err(e) = self.save_history() {
             eprintln!("Failed to save history: {}", e);
         }
-        // Save queue on exit (this is OK since we're exiting anyway)
         if let Err(e) = self.save_queue() {
             eprintln!("Failed to save queue: {}", e);
+        }
+        if let Err(e) = self
+            .persistence
+            .save_download_cache(&self.downloads.get_cache_snapshot())
+        {
+            eprintln!("Failed to save download cache: {}", e);
         }
 
         disable_raw_mode()?;
