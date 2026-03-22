@@ -11,9 +11,8 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    layout::{Constraint, Direction, Layout},
+    widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
 };
 use std::collections::HashMap;
@@ -35,20 +34,20 @@ use crate::youtube::extractor::{self, VideoInfo, YouTubeExtractor};
 
 pub struct MusicPlayerApp {
     // Core modules
-    player: AudioPlayer,
-    queue: Queue,
-    browser_auth: BrowserAuth,
-    available_accounts: Vec<BrowserAccount>,
+    pub(crate) player: AudioPlayer,
+    pub(crate) queue: Queue,
+    pub(crate) browser_auth: BrowserAuth,
+    pub(crate) available_accounts: Vec<BrowserAccount>,
 
     // UI state (sub-structs)
-    ui: UiState,
-    search: SearchState,
-    playlist: PlaylistState,
-    mode: AppMode,
-    current_view: ViewMode,
+    pub(crate) ui: UiState,
+    pub(crate) search: SearchState,
+    pub(crate) playlist: PlaylistState,
+    pub(crate) mode: AppMode,
+    pub(crate) current_view: ViewMode,
     previous_view: ViewMode,
     should_quit: bool,
-    status_message: String,
+    pub(crate) status_message: String,
     queue_loaded: bool,
 
     // Async channels
@@ -58,9 +57,9 @@ pub struct MusicPlayerApp {
     download_tx: mpsc::UnboundedSender<(String, Result<String, String>)>,
 
     // Download state
-    downloaded_files: Arc<Mutex<HashMap<String, String>>>,
+    pub(crate) downloaded_files: Arc<Mutex<HashMap<String, String>>>,
     failed_downloads: Arc<Mutex<HashMap<String, String>>>,
-    active_downloads: Arc<Mutex<usize>>,
+    pub(crate) active_downloads: Arc<Mutex<usize>>,
     downloading_videos: Arc<Mutex<std::collections::HashSet<String>>>,
     background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     pending_play_track: Option<Track>,
@@ -138,19 +137,6 @@ impl MusicPlayerApp {
             pending_play_track: None,
             currently_downloading: None,
         })
-    }
-
-    // Get animated download indicator (Pac-Man style)
-    fn get_download_animation(&self) -> &'static str {
-        // Animate every 8 frames (slower animation)
-        let frame = (self.ui.animation_frame / 8) % 4;
-        match frame {
-            0 => "ᗧ··· ", // Pac-Man open
-            1 => "·ᗧ·· ", // Moving right
-            2 => "··ᗧ· ", // Moving right
-            3 => "···ᗧ ", // Moving right
-            _ => "ᗧ··· ",
-        }
     }
 
     fn load_history() -> Result<Vec<Track>> {
@@ -534,21 +520,23 @@ impl MusicPlayerApp {
     }
 
     fn draw_ui(&self, frame: &mut Frame) {
+        use super::views;
+
         // Show login screen if not authenticated
         if matches!(self.mode, AppMode::LoginPrompt) {
-            self.draw_login_screen(frame);
+            views::login::draw_login_screen(self, frame);
             return;
         }
 
         // Show account picker
         if matches!(self.mode, AppMode::AccountPicker) {
-            self.draw_account_picker(frame);
+            views::login::draw_account_picker(self, frame);
             return;
         }
 
         // Show help screen
         if matches!(self.mode, AppMode::Help) {
-            self.draw_help_screen(frame);
+            views::help::draw_help_screen(self, frame);
             return;
         }
 
@@ -597,16 +585,16 @@ impl MusicPlayerApp {
         // Main area layout depends on queue expansion, my mix expansion, history expansion, or view mode
         if self.ui.queue_expanded {
             // Queue expanded: Queue takes full main area
-            self.draw_queue_expanded(frame, chunks[1]);
+            views::queue::draw_queue_expanded(self, frame, chunks[1]);
         } else if self.ui.my_mix_expanded {
             // My Mix expanded: My Mix takes full main area
-            self.draw_my_mix_expanded(frame, chunks[1]);
+            views::playlist::draw_my_mix_expanded(self, frame, chunks[1]);
         } else if self.ui.history_expanded {
             // History expanded: History takes full main area
-            self.draw_history_expanded(frame, chunks[1]);
+            views::history::draw_history_expanded(self, frame, chunks[1]);
         } else if self.ui.playlist_loading_expanded {
             // Playlist loading expanded: Show URL input interface
-            self.draw_playlist_loading_expanded(frame, chunks[1]);
+            views::playlist::draw_playlist_loading_expanded(self, frame, chunks[1]);
         } else if self.current_view == ViewMode::Search || matches!(self.mode, AppMode::Searching) {
             // Search view: Search Results (left) | History (right)
             let main_chunks = Layout::default()
@@ -614,8 +602,8 @@ impl MusicPlayerApp {
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(chunks[1]);
 
-            self.draw_search_results(frame, main_chunks[0]);
-            self.draw_history(frame, main_chunks[1]);
+            views::search::draw_search_results(self, frame, main_chunks[0]);
+            views::history::draw_history(self, frame, main_chunks[1]);
         } else {
             // Home view (default): Queue (left) | History (right)
             let main_chunks = Layout::default()
@@ -623,8 +611,8 @@ impl MusicPlayerApp {
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(chunks[1]);
 
-            self.draw_queue_compact(frame, main_chunks[0]);
-            self.draw_history(frame, main_chunks[1]);
+            views::queue::draw_queue_compact(self, frame, main_chunks[0]);
+            views::history::draw_history(self, frame, main_chunks[1]);
         }
 
         // Bottom bar: Player (50%) | Cache (15%) | Playlists (35%)
@@ -637,482 +625,9 @@ impl MusicPlayerApp {
             ])
             .split(chunks[2]);
 
-        self.draw_player_compact(frame, bottom_chunks[0]);
-        self.draw_cache_stats(frame, bottom_chunks[1]);
-        self.draw_my_mix(frame, bottom_chunks[2]);
-    }
-
-    fn draw_search_results(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let results: Vec<ListItem> = self
-            .search
-            .results
-            .iter()
-            .enumerate()
-            .map(|(i, video)| {
-                let content = video.title.clone();
-                let style = if i == self.ui.selected_result {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(content).style(style)
-            })
-            .collect();
-
-        let results_list = List::new(results).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Search Results"),
-        );
-        frame.render_widget(results_list, area);
-    }
-
-    fn draw_queue_compact(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        // Show queue items vertically
-        let queue_len = self.queue.len();
-
-        if queue_len == 0 {
-            let queue_widget =
-                Paragraph::new("Queue is empty - Add tracks by pressing Enter on search results")
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("Queue (0 tracks) - Press 't' to expand for management"),
-                    );
-            frame.render_widget(queue_widget, area);
-        } else {
-            // Calculate how many items fit in the visible area (fill the whole box!)
-            let visible_height = area.height.saturating_sub(2) as usize; // Subtract borders
-            let max_items = visible_height.min(queue_len);
-
-            let queue_slice = self.queue.get_queue_slice(0, max_items);
-
-            let items: Vec<ListItem> = queue_slice
-                .iter()
-                .enumerate()
-                .map(|(i, track)| {
-                    let content = format!("{}. {}", i + 1, &track.title);
-                    ListItem::new(content).style(Style::default().fg(Color::White))
-                })
-                .collect();
-
-            let queue_list_widget =
-                List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
-                    "Queue ({} tracks) - Press 't' to expand for management",
-                    queue_len
-                )));
-            frame.render_widget(queue_list_widget, area);
-        }
-    }
-
-    fn draw_queue_expanded(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let total_tracks = self.queue.len();
-
-        // Calculate visible window (show items around selected item)
-        let visible_height = area.height.saturating_sub(2) as usize; // Subtract borders
-        let half_window = visible_height / 2;
-
-        let (start_idx, end_idx) = if total_tracks <= visible_height {
-            // Show all if fits on screen
-            (0, total_tracks)
-        } else {
-            // Calculate scrolling window
-            let start = self.ui.selected_queue_item.saturating_sub(half_window);
-            let end = (start + visible_height).min(total_tracks);
-
-            // Adjust if we're at the end
-            if end == total_tracks && total_tracks > visible_height {
-                (total_tracks - visible_height, total_tracks)
-            } else {
-                (start, end)
-            }
-        };
-
-        // Only get visible slice of tracks - huge performance improvement!
-        let visible_count = end_idx - start_idx;
-        let queue_slice = self.queue.get_queue_slice(start_idx, visible_count);
-
-        let queue_items: Vec<ListItem> = queue_slice
-            .iter()
-            .enumerate()
-            .map(|(i, track)| {
-                let actual_idx = start_idx + i;
-                let content = format!("{}. {}", actual_idx + 1, &track.title);
-                let style = if actual_idx == self.ui.selected_queue_item {
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(content).style(style)
-            })
-            .collect();
-
-        let scroll_indicator = if total_tracks > visible_height {
-            format!(
-                " (Showing {}-{} of {})",
-                start_idx + 1,
-                end_idx,
-                total_tracks
-            )
-        } else {
-            String::new()
-        };
-
-        let queue_list =
-            List::new(queue_items).block(Block::default().borders(Borders::ALL).title(format!(
-                "Queue (Expanded) - {} tracks{} | [j/k] Navigate | [d] Delete | [t] Collapse",
-                total_tracks, scroll_indicator
-            )));
-        frame.render_widget(queue_list, area);
-    }
-
-    fn draw_history(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let queue_history = self.queue.get_history();
-        let total_history = queue_history.len();
-
-        // Calculate how many items fit in the visible area (fill the whole box like queue!)
-        let visible_height = area.height.saturating_sub(2) as usize; // Subtract borders
-        let max_items = visible_height.min(total_history);
-
-        let history_items: Vec<ListItem> = queue_history
-            .iter()
-            .rev() // Show most recent first
-            .take(max_items) // Fill the box!
-            .map(|track| {
-                let content = track.title.clone();
-                ListItem::new(content).style(Style::default().fg(Color::DarkGray))
-            })
-            .collect();
-
-        let history_list =
-            List::new(history_items).block(Block::default().borders(Borders::ALL).title(format!(
-                "History ({} played) - Press [Shift+H] to expand",
-                total_history
-            )));
-        frame.render_widget(history_list, area);
-    }
-
-    fn draw_history_expanded(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let queue_history = self.queue.get_history();
-        let total_history = queue_history.len();
-
-        // Calculate visible window
-        let visible_height = area.height.saturating_sub(2) as usize;
-        let half_window = visible_height / 2;
-
-        let (start_idx, end_idx) = if total_history <= visible_height {
-            (0, total_history)
-        } else {
-            let start = self.ui.selected_history_item.saturating_sub(half_window);
-            let end = (start + visible_height).min(total_history);
-            if end == total_history && total_history > visible_height {
-                (total_history - visible_height, total_history)
-            } else {
-                (start, end)
-            }
-        };
-
-        // Only render visible window
-        let history_items: Vec<ListItem> = queue_history
-            .iter()
-            .rev()
-            .enumerate()
-            .skip(start_idx)
-            .take(end_idx - start_idx)
-            .map(|(i, track)| {
-                let content = format!("{}. {}", i + 1, &track.title);
-                let style = if i == self.ui.selected_history_item {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                ListItem::new(content).style(style)
-            })
-            .collect();
-
-        let scroll_indicator = if total_history > visible_height {
-            format!(
-                " (Showing {}-{} of {})",
-                start_idx + 1,
-                end_idx,
-                total_history
-            )
-        } else {
-            String::new()
-        };
-
-        let history_list = List::new(history_items)
-            .block(Block::default().borders(Borders::ALL).title(format!("History (Expanded) - {} played{} | [j/k] Navigate | [Shift+C] Clear | [Shift+H] Collapse", total_history, scroll_indicator)));
-        frame.render_widget(history_list, area);
-    }
-
-    fn draw_my_mix(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let mix_items: Vec<ListItem> = if !self.playlist.loaded_tracks.is_empty() {
-            // Show first 50 tracks from loaded playlist
-            self.playlist
-                .loaded_tracks
-                .iter()
-                .take(50)
-                .enumerate()
-                .map(|(i, track)| {
-                    let duration = format_time(track.duration as f64);
-                    let content = format!("{}. {} [{}]", i + 1, &track.title, duration);
-                    ListItem::new(content).style(Style::default().fg(Color::White))
-                })
-                .collect()
-        } else if self.playlist.my_mix_playlists.is_empty() {
-            vec![
-                ListItem::new("Press 'l' to load a playlist URL")
-                    .style(Style::default().fg(Color::Yellow)),
-                ListItem::new(""),
-                ListItem::new("YouTube Music playlists supported!"),
-            ]
-        } else {
-            self.playlist
-                .my_mix_playlists
-                .iter()
-                .enumerate()
-                .map(|(i, mix)| {
-                    let content = if mix.track_count > 0 {
-                        format!("{} ({} tracks)", mix.title, mix.track_count)
-                    } else {
-                        mix.title.clone()
-                    };
-                    let style = if i == self.ui.selected_mix_item {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    };
-                    ListItem::new(content).style(style)
-                })
-                .collect()
-        };
-
-        let title = if !self.playlist.loaded_name.is_empty() {
-            format!("{} - Press [l] to load another", self.playlist.loaded_name)
-        } else {
-            "Playlists - Press [l] to load playlist URL".to_string()
-        };
-
-        let mix_list =
-            List::new(mix_items).block(Block::default().borders(Borders::ALL).title(title));
-        frame.render_widget(mix_list, area);
-    }
-
-    fn draw_my_mix_expanded(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let mix_items: Vec<ListItem> = self
-            .playlist
-            .my_mix_playlists
-            .iter()
-            .enumerate()
-            .map(|(i, mix)| {
-                let content = format!("{}. {} ({} tracks)", i + 1, mix.title, mix.track_count);
-                let style = if i == self.ui.selected_mix_item {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(content).style(style)
-            })
-            .collect();
-
-        let mix_list = List::new(mix_items)
-            .block(Block::default().borders(Borders::ALL).title("My Mix (Expanded) - [j/k] Navigate | [Enter] Add to queue | [m] Collapse | [Shift+m] Refresh"));
-        frame.render_widget(mix_list, area);
-    }
-
-    fn draw_playlist_loading_expanded(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        // Expanded playlist loading interface - shows input prominently
-        let loading_text = vec![
-            "📋 Load Playlist from URL",
-            "",
-            "Paste your YouTube or YouTube Music playlist URL below:",
-            "",
-            &format!("URL: {}_", self.playlist.url),
-            "",
-            "",
-            "Instructions:",
-            "  • Paste a YouTube Music playlist URL",
-            "  • Paste a YouTube playlist URL",
-            "  • Press Enter to load",
-            "  • Press Esc to cancel",
-            "",
-            "",
-            "Example URLs:",
-            "  https://music.youtube.com/playlist?list=...",
-            "  https://www.youtube.com/playlist?list=...",
-        ]
-        .join("\n");
-
-        let loading_widget = Paragraph::new(loading_text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Load Playlist (Expanded) - Press [Esc] to cancel"),
-            )
-            .style(Style::default().fg(Color::Cyan))
-            .alignment(Alignment::Left);
-
-        frame.render_widget(loading_widget, area);
-    }
-
-    fn draw_player_compact(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        // Single Player box with 3 lines of content inside
-        let current_track = self.queue.get_current();
-
-        // Line 1: Now Playing title (rotating if too long)
-        let now_playing = if let Some(track) = current_track {
-            let clean_title = clean_title(&track.title);
-            let full_text = format!("{} - {}", clean_title, track.uploader);
-
-            // Scroll text if too long (more than 80 chars)
-            if full_text.len() > 80 {
-                let raw_scroll_pos = self.ui.title_scroll_offset % full_text.len();
-                // Ensure we slice at a valid UTF-8 character boundary
-                // Find the nearest valid char boundary at or before raw_scroll_pos
-                let mut scroll_pos = raw_scroll_pos;
-                while scroll_pos > 0 && !full_text.is_char_boundary(scroll_pos) {
-                    scroll_pos -= 1;
-                }
-                let rotated = format!(
-                    "{}   {}",
-                    &full_text[scroll_pos..],
-                    &full_text[..scroll_pos]
-                );
-
-                // Also ensure the final slice is at a char boundary
-                let max_len = 80.min(rotated.len());
-                let mut end_pos = max_len;
-                while end_pos > 0 && !rotated.is_char_boundary(end_pos) {
-                    end_pos -= 1;
-                }
-                format!("Now Playing: {}", &rotated[..end_pos])
-            } else {
-                format!("Now Playing: {}", full_text)
-            }
-        } else {
-            "No track playing".to_string()
-        };
-
-        // Line 2: Progress bar with bouncing visualization
-        let time_pos = self.player.get_time_pos();
-        let player_duration = self.player.get_duration();
-
-        // ALWAYS prefer player duration (from actual audio) over track.duration (often 0 from flat-playlist)
-        // Also use track.duration as last resort if available and > 0
-        let duration = if player_duration > 0.0 {
-            player_duration
-        } else if let Some(track) = current_track {
-            if track.duration > 0 {
-                track.duration as f64
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
-        // Bouncy bars + timer progress bar
-        let progress_bar = if self.player.get_state() == PlayerState::Playing {
-            // Bouncing bars animation
-            let frame = (self.ui.animation_frame / 4) % 8;
-            let bars = match frame {
-                0 => "▁▂▃▄▅▆▇█▁▂▃▄▅▆▇█▁▂▃▄▅▆▇█",
-                1 => "▂▃▄▅▆▇█▇▂▃▄▅▆▇█▇▂▃▄▅▆▇█▇",
-                2 => "▃▄▅▆▇█▇▆▃▄▅▆▇█▇▆▃▄▅▆▇█▇▆",
-                3 => "▄▅▆▇█▇▆▅▄▅▆▇█▇▆▅▄▅▆▇█▇▆▅",
-                4 => "▅▆▇█▇▆▅▄▅▆▇█▇▆▅▄▅▆▇█▇▆▅▄",
-                5 => "▆▇█▇▆▅▄▃▆▇█▇▆▅▄▃▆▇█▇▆▅▄▃",
-                6 => "▇█▇▆▅▄▃▂▇█▇▆▅▄▃▂▇█▇▆▅▄▃▂",
-                7 => "█▇▆▅▄▃▂▁█▇▆▅▄▃▂▁█▇▆▅▄▃▂▁",
-                _ => "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
-            };
-
-            // Just bars + timer
-            if duration > 0.0 {
-                format!(
-                    "{} {}/{}",
-                    bars,
-                    format_time(time_pos),
-                    format_time(duration)
-                )
-            } else {
-                format!("{} {}", bars, format_time(time_pos))
-            }
-        } else {
-            // When paused, just show time
-            if duration > 0.0 {
-                format!("{}/{}", format_time(time_pos), format_time(duration))
-            } else {
-                "Not playing".to_string()
-            }
-        };
-
-        // Line 3: Status info
-        let state_str = match self.player.get_state() {
-            PlayerState::Playing => "▶ Playing",
-            PlayerState::Paused => "⏸ Paused",
-            PlayerState::Stopped => "⏹ Stopped",
-            PlayerState::Loading => "... Loading",
-        };
-
-        let volume = self.player.get_volume();
-        let status_line = format!(
-            "{} | Vol: {}% | Queue: {} tracks",
-            state_str,
-            volume,
-            self.queue.len()
-        );
-
-        // Combine all 3 lines inside single Player box
-        let player_content = format!("{}\n{}\n{}", now_playing, progress_bar, status_line);
-
-        let player_widget = Paragraph::new(player_content)
-            .block(Block::default().borders(Borders::ALL).title("Player"))
-            .style(Style::default().fg(Color::Cyan));
-
-        frame.render_widget(player_widget, area);
-    }
-
-    fn draw_cache_stats(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        // Cache/Download stats box
-        let active_count = *self
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let cached_count = self
-            .downloaded_files
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len();
-
-        let cache_info = if active_count > 0 {
-            format!(
-                "{}\n⬇ {}\n💾 {}",
-                self.get_download_animation(),
-                active_count,
-                cached_count
-            )
-        } else {
-            format!("💾\n{}\ncached", cached_count)
-        };
-
-        let cache_widget = Paragraph::new(cache_info)
-            .block(Block::default().borders(Borders::ALL).title("Cache"))
-            .style(Style::default().fg(Color::Yellow))
-            .alignment(Alignment::Center);
-
-        frame.render_widget(cache_widget, area);
+        views::player_bar::draw_player_compact(self, frame, bottom_chunks[0]);
+        views::cache_stats::draw_cache_stats(self, frame, bottom_chunks[1]);
+        views::playlist::draw_my_mix(self, frame, bottom_chunks[2]);
     }
 
     async fn handle_input(&mut self, key: KeyEvent) {
@@ -2418,170 +1933,5 @@ impl MusicPlayerApp {
                 }
             }
         }
-    }
-
-    fn draw_account_picker(&self, frame: &mut Frame) {
-        use ratatui::layout::{Alignment, Constraint, Direction, Layout};
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(20),
-                Constraint::Min(10),
-                Constraint::Percentage(20),
-            ])
-            .split(frame.area());
-
-        // Header
-        let header_text = [
-            "Select YouTube Account",
-            "",
-            "Use j/k or ↑/↓ to navigate",
-            "Press Enter to select",
-            "Press Esc to go back",
-            "",
-        ]
-        .join("\n");
-
-        let header = Paragraph::new(header_text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Account Selection"),
-            )
-            .style(Style::default().fg(Color::Cyan))
-            .alignment(Alignment::Center);
-
-        frame.render_widget(header, chunks[0]);
-
-        // Account list
-        let account_items: Vec<ListItem> = self
-            .available_accounts
-            .iter()
-            .enumerate()
-            .map(|(i, account)| {
-                let content = account.display_name.clone();
-                let style = if i == self.ui.selected_account_idx {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                ListItem::new(content).style(style)
-            })
-            .collect();
-
-        let account_list = List::new(account_items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Available Accounts"),
-        );
-
-        frame.render_widget(account_list, chunks[1]);
-    }
-
-    fn draw_help_screen(&self, frame: &mut Frame) {
-        use ratatui::layout::{Alignment, Constraint, Direction, Layout};
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(10),
-                Constraint::Min(10),
-                Constraint::Percentage(10),
-            ])
-            .split(frame.area());
-
-        let help_text = vec![
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━ KEYBINDS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            "",
-            "PLAYBACK:",
-            "  Space     Toggle play/pause",
-            "  n         Play next track",
-            "  p         Play previous track",
-            "  ↑/↓       Volume up/down (Shift for +/-5%)",
-            "  ←/→       Seek backward/forward (not yet implemented)",
-            "",
-            "NAVIGATION:",
-            "  j/k       Navigate lists (down/up)",
-            "  /         Search for music",
-            "  l         Load playlist from URL (YouTube/YouTube Music)",
-            "  h         Go to Home (My Mix) view",
-            "  Esc       Return to previous view",
-            "",
-            "QUEUE MANAGEMENT:",
-            "  Enter     Add selected item to queue",
-            "  t         Toggle queue expansion",
-            "  d         Delete selected queue item (when queue expanded)",
-            "",
-            "MY MIX:",
-            "  m         Toggle My Mix expansion",
-            "  Shift+M   Refresh My Mix (when expanded)",
-            "",
-            "HISTORY:",
-            "  Shift+H   Toggle history expansion",
-            "  Shift+C   Clear history (when history expanded)",
-            "",
-            "OTHER:",
-            "  ?         Show this help screen",
-            "  q         Quit application",
-            "",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            "",
-            "Press '?', 'Esc', or 'q' to close this help screen",
-        ]
-        .join("\n");
-
-        let help_widget = Paragraph::new(help_text)
-            .block(Block::default().borders(Borders::ALL).title("Help"))
-            .style(Style::default().fg(Color::White))
-            .alignment(Alignment::Left);
-
-        frame.render_widget(help_widget, chunks[1]);
-    }
-
-    fn draw_login_screen(&self, frame: &mut Frame) {
-        use ratatui::layout::{Alignment, Constraint, Direction, Layout};
-        use ratatui::widgets::Paragraph;
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(40),
-                Constraint::Length(10),
-                Constraint::Percentage(40),
-            ])
-            .split(frame.area());
-
-        let login_text = [
-            "YouTube Music Player",
-            "",
-            "Welcome! To access YouTube Music, you'll select",
-            "a YouTube account from your browser (Chrome/Firefox).",
-            "",
-            "Make sure you're logged into YouTube in your browser first.",
-            "",
-            "Press 'L' to select account",
-            "Press 'Q' to quit",
-            "",
-            if !self.status_message.is_empty() {
-                &self.status_message
-            } else {
-                ""
-            },
-        ]
-        .join("\n");
-
-        let login_widget = Paragraph::new(login_text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Login Required"),
-            )
-            .style(Style::default().fg(Color::White))
-            .alignment(Alignment::Center);
-
-        frame.render_widget(login_widget, chunks[1]);
     }
 }

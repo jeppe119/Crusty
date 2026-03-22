@@ -1,0 +1,8 @@
+pub(crate) mod cache_stats;
+pub(crate) mod help;
+pub(crate) mod history;
+pub(crate) mod login;
+pub(crate) mod player_bar;
+pub(crate) mod playlist;
+pub(crate) mod queue;
+pub(crate) mod search;

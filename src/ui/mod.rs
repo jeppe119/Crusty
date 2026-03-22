@@ -2,3 +2,4 @@
 
 pub mod app;
 pub(crate) mod state;
+pub(crate) mod views;
