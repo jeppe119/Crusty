@@ -3,6 +3,7 @@
 
 mod config;
 mod player;
+mod services;
 mod ui;
 mod youtube;
 

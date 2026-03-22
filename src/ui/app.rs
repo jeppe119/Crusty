@@ -1,11 +1,9 @@
 // Main TUI application using ratatui
 // Handles the terminal interface, user input, and display
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    },
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -15,17 +13,14 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
 };
-use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-use crate::config::{
-    self, clean_title, format_time, is_allowed_youtube_url, MAX_CONCURRENT_DOWNLOADS,
-    MAX_PLAYLIST_URL_LEN, MAX_SEARCH_QUERY_LEN, MAX_TRACK_DURATION_SECS,
-};
+use crate::config::{clean_title, format_time, is_allowed_youtube_url, MAX_TRACK_DURATION_SECS};
 use crate::player::audio::{AudioPlayer, PlayerState};
 use crate::player::queue::{Queue, Track};
+use crate::services::download::DownloadManager;
+use crate::services::persistence::PersistenceService;
 use crate::ui::state::{
     AppMode, MixPlaylist, PlaylistState, QueueState, SearchState, UiState, ViewMode,
 };
@@ -38,6 +33,8 @@ pub struct MusicPlayerApp {
     pub(crate) queue: Queue,
     pub(crate) browser_auth: BrowserAuth,
     pub(crate) available_accounts: Vec<BrowserAccount>,
+    persistence: PersistenceService,
+    pub(crate) downloads: DownloadManager,
 
     // UI state (sub-structs)
     pub(crate) ui: UiState,
@@ -53,15 +50,8 @@ pub struct MusicPlayerApp {
     // Async channels
     search_rx: mpsc::UnboundedReceiver<Vec<VideoInfo>>,
     search_tx: mpsc::UnboundedSender<Vec<VideoInfo>>,
-    download_rx: mpsc::UnboundedReceiver<(String, Result<String, String>)>,
-    download_tx: mpsc::UnboundedSender<(String, Result<String, String>)>,
 
-    // Download state
-    pub(crate) downloaded_files: Arc<Mutex<HashMap<String, String>>>,
-    failed_downloads: Arc<Mutex<HashMap<String, String>>>,
-    pub(crate) active_downloads: Arc<Mutex<usize>>,
-    downloading_videos: Arc<Mutex<std::collections::HashSet<String>>>,
-    background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    // Playback state
     pending_play_track: Option<Track>,
     currently_downloading: Option<String>,
 }
@@ -69,7 +59,6 @@ pub struct MusicPlayerApp {
 impl MusicPlayerApp {
     pub fn new() -> Result<Self> {
         let (search_tx, search_rx) = mpsc::unbounded_channel();
-        let (download_tx, download_rx) = mpsc::unbounded_channel();
 
         // Initialize browser auth (fallible — may fail if $HOME is unset or config dir is inaccessible)
         let browser_auth = BrowserAuth::new()
@@ -98,8 +87,9 @@ impl MusicPlayerApp {
         };
 
         // Load persisted history
+        let persistence = PersistenceService::new()?;
         let mut queue = Queue::new();
-        if let Ok(history) = Self::load_history() {
+        if let Ok(history) = persistence.load_history() {
             for track in history {
                 queue.add_to_history(track);
             }
@@ -116,6 +106,7 @@ impl MusicPlayerApp {
             queue,
             browser_auth,
             available_accounts: Vec::new(),
+            persistence,
             ui: UiState::default(),
             search: SearchState::default(),
             playlist: PlaylistState::default(),
@@ -125,88 +116,30 @@ impl MusicPlayerApp {
             should_quit: false,
             status_message,
             queue_loaded: false,
+            downloads: DownloadManager::new(),
             search_rx,
             search_tx,
-            download_rx,
-            download_tx,
-            downloaded_files: Arc::new(Mutex::new(HashMap::new())),
-            failed_downloads: Arc::new(Mutex::new(HashMap::new())),
-            active_downloads: Arc::new(Mutex::new(0)),
-            downloading_videos: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            background_tasks: Arc::new(Mutex::new(Vec::new())),
             pending_play_track: None,
             currently_downloading: None,
         })
     }
 
-    fn load_history() -> Result<Vec<Track>> {
-        use std::fs;
-
-        let config_dir = config::config_dir()?;
-
-        let history_file = config_dir.join("history.json");
-
-        if !history_file.exists() {
-            return Ok(Vec::new());
-        }
-
-        // Guard against oversized files on disk
-        let metadata = fs::metadata(&history_file).context("Failed to stat history file")?;
-        if metadata.len() > 10 * 1024 * 1024 {
-            anyhow::bail!("History file too large ({} bytes)", metadata.len());
-        }
-
-        let contents = fs::read_to_string(&history_file).context("Failed to read history file")?;
-        let history: Vec<Track> =
-            serde_json::from_str(&contents).context("Failed to parse history file")?;
-
-        if history.len() > 10_000 {
-            anyhow::bail!("History file contains too many entries ({})", history.len());
-        }
-
-        Ok(history)
+    fn cookie_config(&self) -> Option<(bool, String)> {
+        self.browser_auth
+            .load_selected_account()
+            .map(|account| self.browser_auth.get_cookie_arg(&account))
     }
 
-    fn save_history(&mut self) -> Result<()> {
-        use std::fs;
-
-        // Limit history to 100 most recent tracks before saving
-        self.queue.limit_history(100);
-
-        let config_dir = config::config_dir()?;
-
-        fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
-
-        let history_file = config_dir.join("history.json");
-        let history = self.queue.get_history();
-        let json = serde_json::to_string_pretty(history).context("Failed to serialize history")?;
-
-        fs::write(history_file, json).context("Failed to write history file")?;
-
-        Ok(())
+    fn save_history(&self) -> Result<()> {
+        self.persistence.save_history(self.queue.get_history())
     }
 
     fn save_queue(&self) -> Result<()> {
-        use std::fs;
-
-        let config_dir = config::config_dir()?;
-
-        fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
-
-        let queue_file = config_dir.join("queue.json");
-
-        // Create queue state from current queue
-        let queue_state = QueueState {
+        let state = QueueState {
             tracks: self.queue.get_queue_list(),
             current_track: self.queue.get_current().cloned(),
         };
-
-        let json =
-            serde_json::to_string_pretty(&queue_state).context("Failed to serialize queue")?;
-
-        fs::write(queue_file, json).context("Failed to write queue file")?;
-
-        Ok(())
+        self.persistence.save_queue(&state)
     }
 
     // Async load queue in background
@@ -216,39 +149,9 @@ impl MusicPlayerApp {
         }
 
         let result = tokio::task::spawn_blocking(|| -> Result<QueueState, String> {
-            use std::fs;
-
-            let config_dir = crate::config::config_dir().map_err(|e| e.to_string())?;
-
-            let queue_file = config_dir.join("queue.json");
-
-            if !queue_file.exists() {
-                return Ok(QueueState {
-                    tracks: Vec::new(),
-                    current_track: None,
-                });
-            }
-
-            // Guard against oversized files on disk
-            let metadata = fs::metadata(&queue_file)
-                .map_err(|e| format!("Failed to stat queue file: {}", e))?;
-            if metadata.len() > 10 * 1024 * 1024 {
-                return Err(format!("Queue file too large ({} bytes)", metadata.len()));
-            }
-
-            let contents = fs::read_to_string(&queue_file)
-                .map_err(|e| format!("Failed to read queue file: {}", e))?;
-            let queue_state: QueueState = serde_json::from_str(&contents)
-                .map_err(|e| format!("Failed to parse queue file: {}", e))?;
-
-            if queue_state.tracks.len() > 10_000 {
-                return Err(format!(
-                    "Queue file contains too many entries ({})",
-                    queue_state.tracks.len()
-                ));
-            }
-
-            Ok(queue_state)
+            let svc = crate::services::persistence::PersistenceService::new()
+                .map_err(|e| e.to_string())?;
+            svc.load_queue().map_err(|e| e.to_string())
         })
         .await;
 
@@ -335,7 +238,7 @@ impl MusicPlayerApp {
         let mut terminal = Terminal::new(backend)?;
 
         // Clean up old pre-downloaded files on startup
-        Self::cleanup_old_downloads();
+        DownloadManager::cleanup_old_downloads();
 
         // Trigger async queue load on first iteration
         let mut queue_load_triggered = false;
@@ -382,25 +285,26 @@ impl MusicPlayerApp {
             }
 
             // Check for completed downloads
-            if let Ok((video_id, result)) = self.download_rx.try_recv() {
+            if let Some((video_id, result)) = self.downloads.poll_completion() {
                 match result {
                     Ok(temp_file_path) => {
                         // Download succeeded! Play it if it's the pending track
                         if let Some(track) = &self.pending_play_track {
                             if track.video_id == video_id {
-                                // Use async sleep instead of blocking thread sleep
                                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                 self.player.play_with_duration(
                                     &temp_file_path,
                                     &track.title,
                                     track.duration as f64,
                                 );
-                                self.status_message.clear(); // Clear status - player shows track
+                                self.status_message.clear();
                                 self.pending_play_track = None;
                                 self.currently_downloading = None;
 
-                                // PROACTIVE: Ensure next track is downloading for instant skip
-                                self.ensure_next_track_ready();
+                                // Ensure next track is downloading for instant skip
+                                let next = self.queue.get_queue_slice(0, 10);
+                                self.downloads
+                                    .ensure_next_tracks_ready(&next, self.cookie_config());
 
                                 // Clean up later
                                 let temp_path = temp_file_path.clone();
@@ -411,17 +315,13 @@ impl MusicPlayerApp {
                             }
                         }
 
-                        // RETRY PENDING: Check if there's a pending track waiting (was rate-limited)
+                        // RETRY PENDING: Check if there's a pending track waiting
                         if let Some(pending_track) = &self.pending_play_track {
-                            let cached = self
-                                .downloaded_files
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .contains_key(&pending_track.video_id);
-
-                            if !cached && self.currently_downloading.is_none() {
-                                // Pending track not in cache and not downloading - retry now!
-                                if self.spawn_download_with_limit(pending_track) {
+                            if !self.downloads.is_cached(&pending_track.video_id)
+                                && self.currently_downloading.is_none()
+                            {
+                                let cookie = self.cookie_config();
+                                if self.downloads.spawn_download(pending_track, cookie) {
                                     self.currently_downloading = Some(pending_track.title.clone());
                                 }
                             }
@@ -437,17 +337,13 @@ impl MusicPlayerApp {
                             }
                         }
 
-                        // RETRY PENDING: Even on failure, check if there's a pending track waiting
+                        // RETRY PENDING
                         if let Some(pending_track) = &self.pending_play_track {
-                            let cached = self
-                                .downloaded_files
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .contains_key(&pending_track.video_id);
-
-                            if !cached && self.currently_downloading.is_none() {
-                                // Pending track not in cache and not downloading - retry now!
-                                if self.spawn_download_with_limit(pending_track) {
+                            if !self.downloads.is_cached(&pending_track.video_id)
+                                && self.currently_downloading.is_none()
+                            {
+                                let cookie = self.cookie_config();
+                                if self.downloads.spawn_download(pending_track, cookie) {
                                     self.currently_downloading = Some(pending_track.title.clone());
                                 }
                             }
@@ -487,16 +383,7 @@ impl MusicPlayerApp {
         }
 
         // Abort all background download tasks before saving
-        {
-            let mut tasks = self
-                .background_tasks
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for handle in tasks.drain(..) {
-                handle.abort();
-            }
-        }
-        // Give tasks a moment to abort gracefully
+        self.downloads.abort_all();
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Save history and queue before quitting
@@ -631,215 +518,179 @@ impl MusicPlayerApp {
     }
 
     async fn handle_input(&mut self, key: KeyEvent) {
+        use crate::ui::input::{key_to_command, AppCommand, InputContext};
+
         // Clear status message on any key press (except when searching)
         if !matches!(self.mode, AppMode::Searching) {
             self.status_message.clear();
         }
 
-        let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let ctx = InputContext {
+            mode: &self.mode,
+            history_expanded: self.ui.history_expanded,
+            search_query_len: self.search.query.len(),
+            playlist_url_len: self.playlist.url.len(),
+        };
+        let cmd = key_to_command(key, &ctx);
 
-        match self.mode {
-            AppMode::LoginPrompt => match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
-                KeyCode::Char('l') | KeyCode::Char('L') => {
-                    self.start_login().await;
-                }
-                _ => {}
-            },
-            AppMode::AccountPicker => match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                    self.mode = AppMode::LoginPrompt;
-                }
-                KeyCode::Char('j') | KeyCode::Down => self.next_account(),
-                KeyCode::Char('k') | KeyCode::Up => self.prev_account(),
-                KeyCode::Enter => {
-                    self.select_account().await;
-                }
-                _ => {}
-            },
-            AppMode::Searching => {
-                match key.code {
-                    KeyCode::Char(c) if self.search.query.len() < MAX_SEARCH_QUERY_LEN => {
-                        self.search.query.push(c);
-                    }
-                    KeyCode::Backspace => {
-                        self.search.query.pop();
-                    }
-                    KeyCode::Enter => {
-                        let query = self.search.query.clone();
-                        self.perform_search(&query).await;
-                        self.mode = AppMode::Normal;
-                        // Switch to Search view
-                        self.previous_view = self.current_view;
-                        self.current_view = ViewMode::Search;
-                        self.search.query.clear();
-                    }
-                    KeyCode::Esc => {
-                        self.mode = AppMode::Normal;
-                        self.search.query.clear();
-                        // Return to previous view
-                        std::mem::swap(&mut self.current_view, &mut self.previous_view);
-                    }
-                    _ => {}
+        let Some(cmd) = cmd else { return };
+
+        match cmd {
+            AppCommand::Quit => self.should_quit = true,
+            AppCommand::ShowHelp => self.mode = AppMode::Help,
+            AppCommand::DismissHelp => self.mode = AppMode::Normal,
+            AppCommand::StartSearch => self.mode = AppMode::Searching,
+            AppCommand::StartLogin => self.start_login().await,
+            AppCommand::StartLoadPlaylist => {
+                self.mode = AppMode::LoadingPlaylist;
+                self.ui.playlist_loading_expanded = true;
+                self.playlist.url.clear();
+                self.status_message = "Enter playlist URL (YouTube or YouTube Music)".to_string();
+            }
+
+            // Playback
+            AppCommand::TogglePause => self.toggle_pause_or_start().await,
+            AppCommand::NextTrack => {
+                self.status_message = "Playing next track...".to_string();
+                self.play_next().await;
+            }
+            AppCommand::PreviousTrack => {
+                self.status_message = "Playing previous track...".to_string();
+                self.play_previous().await;
+            }
+            AppCommand::VolumeUp { big_step } => self.volume_up(big_step),
+            AppCommand::VolumeDown { big_step } => self.volume_down(big_step),
+            AppCommand::SeekForward => self.seek_forward(),
+            AppCommand::SeekBackward => self.seek_backward(),
+
+            // Navigation
+            AppCommand::NavigateDown => {
+                if self.ui.queue_expanded {
+                    self.next_queue_item();
+                } else if self.ui.my_mix_expanded {
+                    self.next_mix_item();
+                } else if self.ui.history_expanded {
+                    self.next_history_item();
+                } else if self.current_view == ViewMode::Home {
+                    self.next_mix_item();
+                } else {
+                    self.next_search_result();
                 }
             }
-            AppMode::LoadingPlaylist => match key.code {
-                KeyCode::Char(c) if self.playlist.url.len() < MAX_PLAYLIST_URL_LEN => {
-                    self.playlist.url.push(c);
+            AppCommand::NavigateUp => {
+                if self.ui.queue_expanded {
+                    self.prev_queue_item();
+                } else if self.ui.my_mix_expanded {
+                    self.prev_mix_item();
+                } else if self.ui.history_expanded {
+                    self.prev_history_item();
+                } else if self.current_view == ViewMode::Home {
+                    self.prev_mix_item();
+                } else {
+                    self.prev_search_result();
                 }
-                KeyCode::Backspace => {
-                    self.playlist.url.pop();
+            }
+            AppCommand::Select => {
+                if self.current_view == ViewMode::Home {
+                    self.add_selected_mix_to_queue().await;
+                } else {
+                    self.add_selected_to_queue();
                 }
-                KeyCode::Enter => {
-                    let url = self.playlist.url.clone();
-                    if !url.is_empty() {
-                        self.load_playlist_from_url(&url).await;
-                    }
-                    self.mode = AppMode::Normal;
-                    self.playlist.url.clear();
-                    self.ui.playlist_loading_expanded = false;
+            }
+            AppCommand::GoHome => {
+                self.previous_view = self.current_view;
+                self.current_view = ViewMode::Home;
+                self.status_message = "Returned to Home (My Mix)".to_string();
+            }
+            AppCommand::EscapeBack => {
+                std::mem::swap(&mut self.current_view, &mut self.previous_view);
+                self.status_message = "Returned to previous view".to_string();
+            }
+
+            // Queue / History / Mix
+            AppCommand::ToggleQueueExpand => {
+                self.ui.queue_expanded = !self.ui.queue_expanded;
+                self.status_message = if self.ui.queue_expanded {
+                    "Queue expanded - use j/k to navigate, d to delete".to_string()
+                } else {
+                    "Queue collapsed".to_string()
+                };
+            }
+            AppCommand::ToggleHistoryExpand => {
+                self.ui.history_expanded = !self.ui.history_expanded;
+                self.status_message = if self.ui.history_expanded {
+                    "History expanded - use j/k to navigate, Shift+C to clear".to_string()
+                } else {
+                    "History collapsed".to_string()
+                };
+            }
+            AppCommand::ToggleMixExpand => {
+                self.ui.my_mix_expanded = !self.ui.my_mix_expanded;
+                self.status_message = if self.ui.my_mix_expanded {
+                    "My Mix expanded - use j/k to navigate, Shift+m to refresh".to_string()
+                } else {
+                    "My Mix collapsed".to_string()
+                };
+            }
+            AppCommand::RefreshMix => {
+                if self.ui.my_mix_expanded {
+                    self.status_message = "Refreshing My Mix...".to_string();
+                    self.refresh_my_mix().await;
                 }
-                KeyCode::Esc => {
-                    self.mode = AppMode::Normal;
-                    self.playlist.url.clear();
-                    self.ui.playlist_loading_expanded = false;
-                    self.status_message = "Cancelled playlist loading".to_string();
+            }
+            AppCommand::Delete => {
+                if self.ui.history_expanded {
+                    self.delete_selected_history_item();
+                } else {
+                    self.delete_selected_queue_item();
                 }
-                _ => {}
-            },
-            AppMode::Help => match key.code {
-                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
-                    self.mode = AppMode::Normal;
+            }
+            AppCommand::ClearHistory => self.clear_history(),
+
+            // Account picker
+            AppCommand::NextAccount => self.next_account(),
+            AppCommand::PreviousAccount => self.prev_account(),
+            AppCommand::SelectAccount => self.select_account().await,
+            AppCommand::CancelAccountPicker => self.mode = AppMode::LoginPrompt,
+
+            // Search input
+            AppCommand::SearchChar(c) => self.search.query.push(c),
+            AppCommand::SearchBackspace => {
+                self.search.query.pop();
+            }
+            AppCommand::SearchSubmit => {
+                let query = self.search.query.clone();
+                self.perform_search(&query).await;
+                self.mode = AppMode::Normal;
+                self.previous_view = self.current_view;
+                self.current_view = ViewMode::Search;
+                self.search.query.clear();
+            }
+            AppCommand::SearchCancel => {
+                self.mode = AppMode::Normal;
+                self.search.query.clear();
+                std::mem::swap(&mut self.current_view, &mut self.previous_view);
+            }
+
+            // Playlist URL input
+            AppCommand::PlaylistChar(c) => self.playlist.url.push(c),
+            AppCommand::PlaylistBackspace => {
+                self.playlist.url.pop();
+            }
+            AppCommand::PlaylistSubmit => {
+                let url = self.playlist.url.clone();
+                if !url.is_empty() {
+                    self.load_playlist_from_url(&url).await;
                 }
-                _ => {}
-            },
-            AppMode::Normal => {
-                match key.code {
-                    KeyCode::Char('q') => self.should_quit = true,
-                    KeyCode::Char('?') => self.mode = AppMode::Help,
-                    KeyCode::Char('/') => self.mode = AppMode::Searching,
-                    KeyCode::Char('l') => {
-                        // Expand playlist loading view
-                        self.mode = AppMode::LoadingPlaylist;
-                        self.ui.playlist_loading_expanded = true;
-                        self.playlist.url.clear();
-                        self.status_message =
-                            "Enter playlist URL (YouTube or YouTube Music)".to_string();
-                    }
-                    KeyCode::Char(' ') => self.toggle_pause_or_start().await,
-                    KeyCode::Char('h') | KeyCode::Char('H') => {
-                        if has_shift {
-                            // Shift+H: Toggle history expansion
-                            self.ui.history_expanded = !self.ui.history_expanded;
-                            self.status_message = if self.ui.history_expanded {
-                                "History expanded - use j/k to navigate, Shift+C to clear"
-                                    .to_string()
-                            } else {
-                                "History collapsed".to_string()
-                            };
-                        } else {
-                            // h: Go to home view
-                            self.previous_view = self.current_view;
-                            self.current_view = ViewMode::Home;
-                            self.status_message = "Returned to Home (My Mix)".to_string();
-                        }
-                    }
-                    KeyCode::Char('m') => {
-                        if has_shift {
-                            // Shift+m: Refresh My Mix (only when expanded)
-                            if self.ui.my_mix_expanded {
-                                self.status_message = "Refreshing My Mix...".to_string();
-                                self.refresh_my_mix().await;
-                            }
-                        } else {
-                            // m: Toggle My Mix expansion
-                            self.ui.my_mix_expanded = !self.ui.my_mix_expanded;
-                            self.status_message = if self.ui.my_mix_expanded {
-                                "My Mix expanded - use j/k to navigate, Shift+m to refresh"
-                                    .to_string()
-                            } else {
-                                "My Mix collapsed".to_string()
-                            };
-                        }
-                    }
-                    KeyCode::Char('M') => {
-                        // Capital M (Shift+m): Refresh My Mix
-                        if self.ui.my_mix_expanded {
-                            self.status_message = "Refreshing My Mix...".to_string();
-                            self.refresh_my_mix().await;
-                        }
-                    }
-                    KeyCode::Esc => {
-                        // Return to previous view
-                        std::mem::swap(&mut self.current_view, &mut self.previous_view);
-                        self.status_message = "Returned to previous view".to_string();
-                    }
-                    KeyCode::Char('n') => {
-                        self.status_message = "Playing next track...".to_string();
-                        self.play_next().await;
-                    }
-                    KeyCode::Char('p') => {
-                        self.status_message = "Playing previous track...".to_string();
-                        self.play_previous().await;
-                    }
-                    KeyCode::Char('t') | KeyCode::Char('T') => {
-                        self.ui.queue_expanded = !self.ui.queue_expanded;
-                        self.status_message = if self.ui.queue_expanded {
-                            "Queue expanded - use j/k to navigate, d to delete".to_string()
-                        } else {
-                            "Queue collapsed".to_string()
-                        };
-                    }
-                    KeyCode::Char('d') | KeyCode::Char('D') => {
-                        self.delete_selected_queue_item();
-                    }
-                    KeyCode::Char('c') | KeyCode::Char('C') => {
-                        if has_shift {
-                            // Shift+C: Clear history (only when expanded)
-                            if self.ui.history_expanded {
-                                self.clear_history();
-                            }
-                        }
-                    }
-                    KeyCode::Up => self.volume_up(has_shift),
-                    KeyCode::Down => self.volume_down(has_shift),
-                    KeyCode::Right => self.seek_forward(),
-                    KeyCode::Left => self.seek_backward(),
-                    KeyCode::Char('j') => {
-                        if self.ui.queue_expanded {
-                            self.next_queue_item();
-                        } else if self.ui.my_mix_expanded {
-                            self.next_mix_item();
-                        } else if self.ui.history_expanded {
-                            self.next_history_item();
-                        } else if self.current_view == ViewMode::Home {
-                            self.next_mix_item();
-                        } else {
-                            self.next_search_result();
-                        }
-                    }
-                    KeyCode::Char('k') => {
-                        if self.ui.queue_expanded {
-                            self.prev_queue_item();
-                        } else if self.ui.my_mix_expanded {
-                            self.prev_mix_item();
-                        } else if self.ui.history_expanded {
-                            self.prev_history_item();
-                        } else if self.current_view == ViewMode::Home {
-                            self.prev_mix_item();
-                        } else {
-                            self.prev_search_result();
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if self.current_view == ViewMode::Home {
-                            self.add_selected_mix_to_queue().await;
-                        } else {
-                            self.add_selected_to_queue();
-                        }
-                    }
-                    _ => {}
-                }
+                self.mode = AppMode::Normal;
+                self.playlist.url.clear();
+                self.ui.playlist_loading_expanded = false;
+            }
+            AppCommand::PlaylistCancel => {
+                self.mode = AppMode::Normal;
+                self.playlist.url.clear();
+                self.ui.playlist_loading_expanded = false;
+                self.status_message = "Cancelled playlist loading".to_string();
             }
         }
     }
@@ -900,358 +751,43 @@ impl MusicPlayerApp {
     // All play methods (play_next, play_previous, play_selected_queue_track,
     // play_current_or_first) delegate to this to avoid duplication.
     fn play_track_from_cache_or_download(&mut self, track: &Track) {
-        // Check if already in cache
-        let cached_file = self
-            .downloaded_files
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&track.video_id)
-            .cloned();
+        let cached_file = self.downloads.get_cached_file(&track.video_id);
 
         if let Some(local_file) = cached_file {
-            // Verify file actually exists before playing (cleanup might have deleted it)
             if std::path::Path::new(&local_file).exists() {
                 self.player
                     .play_with_duration(&local_file, &track.title, track.duration as f64);
                 self.status_message.clear();
-                self.ensure_next_track_ready();
+                let next = self.queue.get_queue_slice(0, 10);
+                self.downloads
+                    .ensure_next_tracks_ready(&next, self.cookie_config());
             } else {
-                // File was deleted - remove from cache and re-download
-                self.downloaded_files
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&track.video_id);
+                self.downloads.remove_from_cache(&track.video_id);
                 self.pending_play_track = Some(track.clone());
-                if self.spawn_download_with_limit(track) {
+                let cookie = self.cookie_config();
+                if self.downloads.spawn_download(track, cookie) {
                     self.currently_downloading = Some(track.title.clone());
                 }
             }
         } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
-            // Not in cache - spawn download (rate-limited)
             self.pending_play_track = Some(track.clone());
-            if self.spawn_download_with_limit(track) {
+            let cookie = self.cookie_config();
+            if self.downloads.spawn_download(track, cookie) {
                 self.currently_downloading = Some(track.title.clone());
             }
         } else {
-            // Direct URL (not YouTube) - reject non-YouTube URLs for safety
             self.status_message = "Cannot play non-YouTube URL".to_string();
         }
     }
 
-    // ==========================================
-    // CENTRALIZED DOWNLOAD SYSTEM
-    // ==========================================
-    // This is the ONLY function that should spawn downloads.
-    // All other code paths must call this function.
-    //
-    // Features:
-    // - Global rate limiting (max 30 concurrent downloads for fast bulk downloading)
-    // - Populates cache only (not tied to specific playback)
-    // - Tracks active downloads with atomic counter
-    // - Handles success/failure and updates appropriate maps
     fn spawn_download_with_limit(&self, track: &Track) -> bool {
-        // RATE LIMIT: Allow up to 30 concurrent downloads for fast bulk downloading
-        // Increased from 15 to improve performance, especially when window is unfocused
-        let active_count = *self
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        if active_count >= MAX_CONCURRENT_DOWNLOADS {
-            // Already at max downloads, skip
-            return false;
-        }
-
-        let video_id = &track.video_id;
-
-        // Skip if already downloaded
-        if self
-            .downloaded_files
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(video_id)
-        {
-            return false; // Already in cache
-        }
-
-        // Skip if download already failed (will retry when playing)
-        if self
-            .failed_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(video_id)
-        {
-            return false; // Known failure
-        }
-
-        // CRITICAL: Skip if already downloading (prevents SPACE spam duplicates!)
-        {
-            let mut downloading = self
-                .downloading_videos
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if downloading.contains(video_id) {
-                return false; // Already downloading this video
-            }
-            // Mark as downloading
-            downloading.insert(video_id.clone());
-        }
-
-        // Increment active download counter
-        *self
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) += 1;
-
-        let video_id = track.video_id.clone();
-        let youtube_url = track.url.clone();
-        let cookie_config = self
-            .browser_auth
-            .load_selected_account()
-            .map(|account| self.browser_auth.get_cookie_arg(&account));
-        let downloaded_files = self.downloaded_files.clone();
-        let failed_downloads = self.failed_downloads.clone();
-        let active_downloads = self.active_downloads.clone();
-        let downloading_videos = self.downloading_videos.clone();
-        let download_tx = self.download_tx.clone();
-
-        let handle = tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                Self::fetch_audio_url_blocking(&youtube_url, cookie_config)
-            })
-            .await;
-
-            match result {
-                Ok(Ok(file_path)) => {
-                    // Add to cache
-                    downloaded_files
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(video_id.clone(), file_path.clone());
-                    // Notify main thread with ACTUAL file path (for auto-play if pending)
-                    let _ = download_tx.send((video_id.clone(), Ok(file_path)));
-                }
-                Ok(Err(e)) => {
-                    failed_downloads
-                        .lock()
-                        .unwrap_or_else(|e2| e2.into_inner())
-                        .insert(video_id.clone(), e.clone());
-                    let _ = download_tx.send((video_id.clone(), Err(e)));
-                }
-                Err(e) => {
-                    let error_msg = "Download task failed unexpectedly".to_string();
-                    eprintln!("Download task join error: {}", e);
-                    failed_downloads
-                        .lock()
-                        .unwrap_or_else(|e2| e2.into_inner())
-                        .insert(video_id.clone(), error_msg.clone());
-                    let _ = download_tx.send((video_id.clone(), Err(error_msg)));
-                }
-            }
-
-            // IMPORTANT: Decrement active download count and remove from in-flight tracker
-            {
-                let mut count = active_downloads.lock().unwrap_or_else(|e| e.into_inner());
-                *count = count.saturating_sub(1);
-            }
-            // Remove from downloading tracker (allows retry if user presses SPACE again)
-            downloading_videos
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&video_id);
-        });
-
-        // Track the background task for proper cleanup, pruning finished tasks
-        {
-            let mut tasks = self
-                .background_tasks
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            tasks.retain(|h| !h.is_finished());
-            tasks.push(handle);
-        }
-
-        true // Download was spawned
-    }
-
-    // Trigger smart downloads: download tracks near current position
-    // PROACTIVE BUFFER BUILDING - For instant playback as you navigate
-    // ==========================================
-    // Called when a track starts playing to keep building the download buffer
-    // Downloads next 10 tracks to maintain smooth playback without CPU spikes
-    fn ensure_next_track_ready(&self) {
-        // Download next 10 tracks from queue position 0
-        // This keeps a rolling buffer as user plays through the playlist
-        // Distributed load: 10 tracks per song = smooth, no spike
-        let next_tracks = self.queue.get_queue_slice(0, 10);
-        for track in next_tracks.iter() {
-            self.spawn_download_with_limit(track);
-        }
+        self.downloads.spawn_download(track, self.cookie_config())
     }
 
     fn trigger_smart_downloads(&self) {
-        // LIGHTWEIGHT strategy: Download next 10 tracks from queue (reduced from 20)
-        // Less concurrent downloads = faster priority track completion
-        // With 30 concurrent downloads max, this still provides good buffering
-        // ensure_next_track_ready() handles immediate next track
-        // History tracks stay cached automatically (never deleted)
-
-        // Download next 10 tracks from queue position 0 (reduced for FAST UX)
         let next_tracks = self.queue.get_queue_slice(0, 10);
-        for track in next_tracks.iter() {
-            self.spawn_download_with_limit(track);
-        }
-
-        // History is already cached - no need to re-download!
-    }
-
-    // Clean up old pre-downloaded files from temp directory
-    fn cleanup_old_downloads() {
-        use std::env;
-        use std::time::{Duration, SystemTime};
-
-        let temp_dir = env::temp_dir();
-
-        // Try to read temp directory
-        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-            let now = SystemTime::now();
-            let max_age = Duration::from_secs(3600); // 1 hour
-
-            for entry in entries.flatten() {
-                if let Ok(file_name) = entry.file_name().into_string() {
-                    // Only target our audio files
-                    if file_name.starts_with("yt-music-audio-") {
-                        // Check file age
-                        if let Ok(metadata) = entry.metadata() {
-                            if let Ok(modified) = metadata.modified() {
-                                if let Ok(age) = now.duration_since(modified) {
-                                    // Delete files older than max_age
-                                    if age > max_age {
-                                        let _ = std::fs::remove_file(entry.path());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Helper to download audio to temp file using yt-dlp
-    fn fetch_audio_url_blocking(
-        youtube_url: &str,
-        cookie_config: Option<(bool, String)>,
-    ) -> Result<String, String> {
-        use std::env;
-        use std::process::Command;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        // Validate URL before passing to yt-dlp
-        if !is_allowed_youtube_url(youtube_url) {
-            return Err("Invalid URL: must be a YouTube or YouTube Music URL".to_string());
-        }
-
-        // Create unique temp file path for audio download
-        let temp_dir = env::temp_dir();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros();
-        let temp_file = temp_dir.join(format!(
-            "yt-music-audio-{}-{}.%(ext)s",
-            std::process::id(),
-            timestamp
-        ));
-
-        let mut cmd = Command::new("yt-dlp");
-        cmd.arg("-f")
-            .arg("bestaudio/best") // Get best audio
-            .arg("-x") // Extract audio only
-            .arg("--audio-format")
-            .arg("mp3") // Convert to MP3 (universally supported)
-            .arg("--audio-quality")
-            .arg("192K") // 192 kbps bitrate
-            .arg("-o")
-            .arg(&temp_file) // Output to temp file (yt-dlp will replace %(ext)s)
-            .arg("--no-playlist") // Don't download playlists
-            .arg("--no-mtime") // Don't preserve modification time
-            .arg("--socket-timeout")
-            .arg("30")
-            .arg("--retries")
-            .arg("2");
-
-        // Add cookies from browser if available
-        if let Some((_use_from_browser, cookie_arg)) = cookie_config {
-            cmd.arg("--cookies-from-browser").arg(cookie_arg);
-        }
-
-        cmd.arg(youtube_url);
-
-        // Run yt-dlp and wait for completion
-        let output = cmd
-            .output()
-            .map_err(|e| format!("Failed to run yt-dlp: {}. Is yt-dlp installed?", e))?;
-
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            // Log full error for debugging but return sanitized message to UI
-            eprintln!("yt-dlp download error: {}", error);
-            return Err("yt-dlp download failed — check logs for details".to_string());
-        }
-
-        // yt-dlp replaces %(ext)s with actual extension, so find the file
-        let temp_dir_path = env::temp_dir();
-        let search_pattern = format!("yt-music-audio-{}-{}", std::process::id(), timestamp);
-
-        // Find the downloaded file
-        let files: Vec<_> = std::fs::read_dir(&temp_dir_path)
-            .map_err(|e| format!("Failed to read temp dir: {}", e))?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(&search_pattern)
-            })
-            .collect();
-
-        if files.is_empty() {
-            return Err(format!(
-                "yt-dlp completed but no audio file found (searched for {}.*)",
-                search_pattern
-            ));
-        }
-
-        let downloaded_file = files[0].path();
-
-        // Canonicalize and verify the file is within the temp directory
-        let canonical = downloaded_file
-            .canonicalize()
-            .map_err(|e| format!("Failed to canonicalize downloaded file path: {}", e))?;
-        let temp_canonical = temp_dir_path
-            .canonicalize()
-            .map_err(|e| format!("Failed to canonicalize temp dir: {}", e))?;
-        if !canonical.starts_with(&temp_canonical) {
-            return Err("Downloaded file path is outside temp directory".to_string());
-        }
-
-        // Verify file exists and has content
-        let metadata = std::fs::metadata(&canonical)
-            .map_err(|e| format!("Failed to check downloaded file: {}", e))?;
-
-        if metadata.len() == 0 {
-            return Err("Downloaded file is empty".to_string());
-        }
-
-        if metadata.len() < 10000 {
-            return Err(format!(
-                "Downloaded file is too small ({} bytes), likely incomplete",
-                metadata.len()
-            ));
-        }
-
-        Ok(canonical.to_string_lossy().to_string())
+        self.downloads
+            .ensure_next_tracks_ready(&next_tracks, self.cookie_config());
     }
 
     async fn toggle_pause_or_start(&mut self) {
@@ -1401,19 +937,9 @@ impl MusicPlayerApp {
     }
 
     fn trigger_hover_download(&self, index: usize) {
-        // SLIDING WINDOW STRATEGY:
-        // Download ONLY 1 track at position +15 from hover
-        // This maintains a 15-track lookahead buffer while only downloading 1 track per keypress
-        // Super efficient - no CPU spikes! (Max 30 concurrent downloads total)
-        let download_index = index + 15;
-
-        // Get the track at position +15
-        let queue_slice = self.queue.get_queue_slice(download_index, 1);
-        if let Some(&track) = queue_slice.first() {
-            // Use centralized download function (handles rate limiting, cache checks, etc.)
-            self.spawn_download_with_limit(track);
-        }
-        // Going backward? Already cached from history! No download needed.
+        let queue_slice = self.queue.get_queue_slice(index + 15, 1);
+        self.downloads
+            .trigger_hover_download(&queue_slice, self.cookie_config());
     }
 
     fn delete_selected_queue_item(&mut self) {
@@ -1482,6 +1008,31 @@ impl MusicPlayerApp {
         // Save to disk
         if let Err(e) = self.save_history() {
             self.status_message = format!("History cleared but failed to save: {}", e);
+        }
+    }
+
+    fn delete_selected_history_item(&mut self) {
+        let history_len = self.queue.get_history().len();
+        if history_len == 0 {
+            return;
+        }
+
+        if let Some(removed) = self.queue.remove_history_at(self.ui.selected_history_item) {
+            let title = clean_title(&removed.title);
+            self.status_message = format!("Removed '{}' from history", title);
+
+            // Adjust selection
+            let new_len = self.queue.get_history().len();
+            if new_len == 0 {
+                self.ui.selected_history_item = 0;
+            } else if self.ui.selected_history_item >= new_len {
+                self.ui.selected_history_item = new_len - 1;
+            }
+
+            // Save to disk
+            if let Err(e) = self.save_history() {
+                eprintln!("Failed to save history after delete: {}", e);
+            }
         }
     }
 

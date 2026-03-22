@@ -572,6 +572,15 @@ impl Queue {
         self.history.clear();
     }
 
+    /// Removes a single track from history by index. Returns the removed track.
+    pub fn remove_history_at(&mut self, index: usize) -> Option<Track> {
+        if index < self.history.len() {
+            Some(self.history.remove(index))
+        } else {
+            None
+        }
+    }
+
     // ==========================================
     // QUEUE MANAGEMENT: limit_history()
     // ==========================================
@@ -845,6 +854,39 @@ mod tests {
         queue.add_to_history(make_track("x"));
         assert_eq!(queue.get_history().len(), 1);
         assert_eq!(queue.get_history()[0].video_id, "x");
+    }
+
+    #[test]
+    fn test_remove_history_at_valid_index() {
+        let mut queue = Queue::new();
+        queue.add_to_history(make_track("a"));
+        queue.add_to_history(make_track("b"));
+        queue.add_to_history(make_track("c"));
+
+        let removed = queue.remove_history_at(1);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().video_id, "b");
+        assert_eq!(queue.get_history().len(), 2);
+        assert_eq!(queue.get_history()[0].video_id, "a");
+        assert_eq!(queue.get_history()[1].video_id, "c");
+    }
+
+    #[test]
+    fn test_remove_history_at_invalid_index() {
+        let mut queue = Queue::new();
+        queue.add_to_history(make_track("a"));
+        assert!(queue.remove_history_at(5).is_none());
+        assert_eq!(queue.get_history().len(), 1);
+    }
+
+    #[test]
+    fn test_remove_history_at_last() {
+        let mut queue = Queue::new();
+        queue.add_to_history(make_track("a"));
+
+        let removed = queue.remove_history_at(0);
+        assert_eq!(removed.unwrap().video_id, "a");
+        assert!(queue.get_history().is_empty());
     }
 
     #[test]

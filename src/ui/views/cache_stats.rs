@@ -11,10 +11,12 @@ use super::player_bar::get_download_animation;
 pub(crate) fn draw_cache_stats(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
     // Cache/Download stats box
     let active_count = *app
+        .downloads
         .active_downloads
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let cached_count = app
+        .downloads
         .downloaded_files
         .lock()
         .unwrap_or_else(|e| e.into_inner())
