@@ -246,6 +246,16 @@ impl BrowserAuth {
         std::fs::write(&config_path, json)
             .map_err(|e| format!("Failed to write account: {}", e))?;
 
+        // Restrict permissions to owner-only (consistent with history.json / queue.json)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &config_path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+
         Ok(())
     }
 

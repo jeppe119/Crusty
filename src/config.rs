@@ -19,6 +19,18 @@ pub(crate) const MAX_PLAYLIST_URL_LEN: usize = 2048;
 /// Maximum concurrent downloads (kept low to avoid resource exhaustion).
 pub(crate) const MAX_CONCURRENT_DOWNLOADS: usize = 5;
 
+/// Seconds to wait before deleting a played audio file from temp.
+pub(crate) const PLAYED_FILE_CLEANUP_DELAY_SECS: u64 = 300;
+
+/// Maximum age (in seconds) of temp audio files before cleanup sweeps remove them.
+pub(crate) const TEMP_FILE_MAX_AGE_SECS: u64 = 3600;
+
+/// Number of tracks to pre-download ahead of the current position.
+pub(crate) const LOOKAHEAD_DOWNLOAD_COUNT: usize = 10;
+
+/// Number of tracks to pre-download on startup/queue restore.
+pub(crate) const STARTUP_DOWNLOAD_COUNT: usize = 5;
+
 /// Returns the application config directory path (e.g., `~/.config/youtube-music-player`).
 pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
     let dir = dirs::config_dir()

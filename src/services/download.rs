@@ -5,31 +5,44 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use crate::config::{is_allowed_youtube_url, MAX_CONCURRENT_DOWNLOADS};
+use crate::config::{is_allowed_youtube_url, MAX_CONCURRENT_DOWNLOADS, TEMP_FILE_MAX_AGE_SECS};
 use crate::player::queue::Track;
 
 /// Result of a completed download: (video_id, Ok(file_path) | Err(error_message)).
 pub(crate) type DownloadResult = (String, Result<String, String>);
 
+/// Unified state for all download tracking, guarded by a single mutex.
+struct DownloadState {
+    downloaded_files: HashMap<String, String>,
+    failed_downloads: HashMap<String, String>,
+    active_count: usize,
+    downloading_videos: HashSet<String>,
+}
+
 /// Manages background audio downloads with rate limiting and caching.
 pub(crate) struct DownloadManager {
-    downloaded_files: Arc<Mutex<HashMap<String, String>>>,
-    failed_downloads: Arc<Mutex<HashMap<String, String>>>,
-    active_downloads: Arc<Mutex<usize>>,
-    downloading_videos: Arc<Mutex<HashSet<String>>>,
+    state: Arc<Mutex<DownloadState>>,
     background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     download_tx: mpsc::UnboundedSender<DownloadResult>,
     download_rx: mpsc::UnboundedReceiver<DownloadResult>,
+}
+
+impl Default for DownloadManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DownloadManager {
     pub fn new() -> Self {
         let (download_tx, download_rx) = mpsc::unbounded_channel();
         Self {
-            downloaded_files: Arc::new(Mutex::new(HashMap::new())),
-            failed_downloads: Arc::new(Mutex::new(HashMap::new())),
-            active_downloads: Arc::new(Mutex::new(0)),
-            downloading_videos: Arc::new(Mutex::new(HashSet::new())),
+            state: Arc::new(Mutex::new(DownloadState {
+                downloaded_files: HashMap::new(),
+                failed_downloads: HashMap::new(),
+                active_count: 0,
+                downloading_videos: HashSet::new(),
+            })),
             background_tasks: Arc::new(Mutex::new(Vec::new())),
             download_tx,
             download_rx,
@@ -37,48 +50,61 @@ impl DownloadManager {
     }
 
     /// Poll for a completed download without blocking.
+    /// Also prunes finished background tasks to prevent unbounded growth.
     pub fn poll_completion(&mut self) -> Option<DownloadResult> {
+        // Prune finished tasks on each poll cycle
+        {
+            let mut tasks = self
+                .background_tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            tasks.retain(|h| !h.is_finished());
+        }
         self.download_rx.try_recv().ok()
     }
 
     /// Returns the number of currently active downloads.
     pub fn active_count(&self) -> usize {
-        *self
-            .active_downloads
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .active_count
     }
 
     /// Returns the number of cached (downloaded) files.
     pub fn cached_count(&self) -> usize {
-        self.downloaded_files
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .downloaded_files
             .len()
     }
 
     /// Returns true if the video is already cached.
     pub fn is_cached(&self, video_id: &str) -> bool {
-        self.downloaded_files
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .downloaded_files
             .contains_key(video_id)
     }
 
     /// Returns the cached file path for a video, if available.
     pub fn get_cached_file(&self, video_id: &str) -> Option<String> {
-        self.downloaded_files
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .downloaded_files
             .get(video_id)
             .cloned()
     }
 
     /// Removes a video from the download cache (e.g., when file was deleted).
     pub fn remove_from_cache(&self, video_id: &str) {
-        self.downloaded_files
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .downloaded_files
             .remove(video_id);
     }
 
@@ -86,61 +112,31 @@ impl DownloadManager {
     /// `cookie_config` is optional browser cookie info: (use_from_browser, cookie_arg).
     /// Returns true if a download was actually spawned.
     pub fn spawn_download(&self, track: &Track, cookie_config: Option<(bool, String)>) -> bool {
-        let active_count = *self
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        if active_count >= MAX_CONCURRENT_DOWNLOADS {
-            return false;
-        }
-
-        let video_id = &track.video_id;
-
-        // Skip if already downloaded
-        if self
-            .downloaded_files
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(video_id)
+        // Single lock acquisition for all precondition checks + slot claim
         {
-            return false;
-        }
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Skip if download already failed
-        if self
-            .failed_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(video_id)
-        {
-            return false;
-        }
-
-        // Skip if already downloading
-        {
-            let mut downloading = self
-                .downloading_videos
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if downloading.contains(video_id) {
+            if state.active_count >= MAX_CONCURRENT_DOWNLOADS {
                 return false;
             }
-            downloading.insert(video_id.clone());
-        }
+            if state.downloaded_files.contains_key(&track.video_id) {
+                return false;
+            }
+            if state.failed_downloads.contains_key(&track.video_id) {
+                return false;
+            }
+            if state.downloading_videos.contains(&track.video_id) {
+                return false;
+            }
 
-        // Increment active download counter
-        *self
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) += 1;
+            // Atomically claim the download slot
+            state.downloading_videos.insert(track.video_id.clone());
+            state.active_count += 1;
+        }
 
         let video_id = track.video_id.clone();
         let youtube_url = track.url.clone();
-        let downloaded_files = self.downloaded_files.clone();
-        let failed_downloads = self.failed_downloads.clone();
-        let active_downloads = self.active_downloads.clone();
-        let downloading_videos = self.downloading_videos.clone();
+        let state = self.state.clone();
         let download_tx = self.download_tx.clone();
 
         let handle = tokio::spawn(async move {
@@ -149,41 +145,35 @@ impl DownloadManager {
             })
             .await;
 
-            match result {
-                Ok(Ok(file_path)) => {
-                    downloaded_files
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(video_id.clone(), file_path.clone());
-                    let _ = download_tx.send((video_id.clone(), Ok(file_path)));
+            // Single lock for all post-download bookkeeping
+            {
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                match &result {
+                    Ok(Ok(file_path)) => {
+                        st.downloaded_files
+                            .insert(video_id.clone(), file_path.clone());
+                    }
+                    Ok(Err(e)) => {
+                        st.failed_downloads.insert(video_id.clone(), e.clone());
+                    }
+                    Err(_) => {
+                        st.failed_downloads.insert(
+                            video_id.clone(),
+                            "Download task failed unexpectedly".to_string(),
+                        );
+                    }
                 }
-                Ok(Err(e)) => {
-                    failed_downloads
-                        .lock()
-                        .unwrap_or_else(|e2| e2.into_inner())
-                        .insert(video_id.clone(), e.clone());
-                    let _ = download_tx.send((video_id.clone(), Err(e)));
-                }
-                Err(e) => {
-                    let error_msg = "Download task failed unexpectedly".to_string();
-                    eprintln!("Download task join error: {}", e);
-                    failed_downloads
-                        .lock()
-                        .unwrap_or_else(|e2| e2.into_inner())
-                        .insert(video_id.clone(), error_msg.clone());
-                    let _ = download_tx.send((video_id.clone(), Err(error_msg)));
-                }
+                st.active_count = st.active_count.saturating_sub(1);
+                st.downloading_videos.remove(&video_id);
             }
 
-            // Decrement active download count and remove from in-flight tracker
-            {
-                let mut count = active_downloads.lock().unwrap_or_else(|e| e.into_inner());
-                *count = count.saturating_sub(1);
-            }
-            downloading_videos
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&video_id);
+            // Send result outside the lock
+            let send_result = match result {
+                Ok(Ok(file_path)) => Ok(file_path),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err("Download task failed unexpectedly".to_string()),
+            };
+            let _ = download_tx.send((video_id, send_result));
         });
 
         // Track the background task, pruning finished ones
@@ -241,7 +231,7 @@ impl DownloadManager {
 
         if let Ok(entries) = std::fs::read_dir(&temp_dir) {
             let now = SystemTime::now();
-            let max_age = Duration::from_secs(3600);
+            let max_age = Duration::from_secs(TEMP_FILE_MAX_AGE_SECS);
 
             for entry in entries.flatten() {
                 if let Ok(file_name) = entry.file_name().into_string() {
@@ -303,8 +293,10 @@ fn fetch_audio_url_blocking(
         .arg("--retries")
         .arg("2");
 
-    if let Some((_use_from_browser, cookie_arg)) = cookie_config {
-        cmd.arg("--cookies-from-browser").arg(cookie_arg);
+    if let Some((use_from_browser, cookie_arg)) = cookie_config {
+        if use_from_browser {
+            cmd.arg("--cookies-from-browser").arg(cookie_arg);
+        }
     }
 
     cmd.arg(youtube_url);
@@ -315,8 +307,8 @@ fn fetch_audio_url_blocking(
 
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr);
-        eprintln!("yt-dlp download error: {}", error);
-        return Err("yt-dlp download failed — check logs for details".to_string());
+        let snippet: String = error.chars().take(200).collect();
+        return Err(format!("yt-dlp download failed: {}", snippet));
     }
 
     // Find the downloaded file (yt-dlp replaces %(ext)s with actual extension)

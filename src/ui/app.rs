@@ -16,14 +16,17 @@ use ratatui::{
 use std::io;
 use tokio::sync::mpsc;
 
-use crate::config::{clean_title, format_time, is_allowed_youtube_url, MAX_TRACK_DURATION_SECS};
+use crate::config::{
+    is_allowed_youtube_url, LOOKAHEAD_DOWNLOAD_COUNT, PLAYED_FILE_CLEANUP_DELAY_SECS,
+    STARTUP_DOWNLOAD_COUNT,
+};
 use crate::player::audio::{AudioPlayer, PlayerState};
 use crate::player::queue::{Queue, Track};
 use crate::services::download::DownloadManager;
 use crate::services::persistence::PersistenceService;
 use crate::ui::state::{AppMode, PlaylistState, QueueState, SearchState, UiState, ViewMode};
 use crate::youtube::browser_auth::{BrowserAccount, BrowserAuth};
-use crate::youtube::extractor::{VideoInfo, YouTubeExtractor};
+use crate::youtube::extractor::VideoInfo;
 
 pub struct MusicPlayerApp {
     // Core modules
@@ -31,7 +34,7 @@ pub struct MusicPlayerApp {
     pub(crate) queue: Queue,
     pub(crate) browser_auth: BrowserAuth,
     pub(crate) available_accounts: Vec<BrowserAccount>,
-    persistence: PersistenceService,
+    pub(super) persistence: PersistenceService,
     pub(crate) downloads: DownloadManager,
 
     // UI state (sub-structs)
@@ -47,11 +50,11 @@ pub struct MusicPlayerApp {
 
     // Async channels
     search_rx: mpsc::UnboundedReceiver<Vec<VideoInfo>>,
-    search_tx: mpsc::UnboundedSender<Vec<VideoInfo>>,
+    pub(super) search_tx: mpsc::UnboundedSender<Vec<VideoInfo>>,
 
     // Playback state
-    pending_play_track: Option<Track>,
-    currently_downloading: Option<String>,
+    pub(super) pending_play_track: Option<Track>,
+    pub(super) currently_downloading: Option<String>,
 }
 
 impl MusicPlayerApp {
@@ -123,17 +126,17 @@ impl MusicPlayerApp {
         })
     }
 
-    fn cookie_config(&self) -> Option<(bool, String)> {
+    pub(super) fn cookie_config(&self) -> Option<(bool, String)> {
         self.browser_auth
             .load_selected_account()
             .map(|account| self.browser_auth.get_cookie_arg(&account))
     }
 
-    fn save_history(&self) -> Result<()> {
+    pub(super) fn save_history(&self) -> Result<()> {
         self.persistence.save_history(self.queue.get_history())
     }
 
-    fn save_queue(&self) -> Result<()> {
+    pub(super) fn save_queue(&self) -> Result<()> {
         let state = QueueState {
             tracks: self.queue.get_queue_list(),
             current_track: self.queue.get_current().cloned(),
@@ -182,10 +185,9 @@ impl MusicPlayerApp {
                     }
                 }
 
-                // Download next 5 tracks only (reduced from 20 for FAST startup)
-                // Less concurrent downloads = faster completion of priority tracks
-                // ensure_next_track_ready() will handle the rest as user plays
-                let next_tracks = self.queue.get_queue_slice(0, 5);
+                // Download a small batch on startup for fast initial playback.
+                // ensure_next_track_ready() handles the rest as user plays.
+                let next_tracks = self.queue.get_queue_slice(0, STARTUP_DOWNLOAD_COUNT);
                 for (idx, track) in next_tracks.iter().enumerate() {
                     if idx == 0 && !has_current {
                         // CRITICAL: If no current track, first queue track is HIGHEST priority
@@ -219,11 +221,11 @@ impl MusicPlayerApp {
                 }
             }
             Ok(Err(e)) => {
-                eprintln!("Failed to load queue: {}", e);
+                self.status_message = format!("Failed to load queue: {}", e);
                 self.queue_loaded = true; // Mark as loaded anyway to avoid retrying
             }
             Err(e) => {
-                eprintln!("Task error loading queue: {}", e);
+                self.status_message = format!("Task error loading queue: {}", e);
                 self.queue_loaded = true;
             }
         }
@@ -301,14 +303,17 @@ impl MusicPlayerApp {
                                 self.currently_downloading = None;
 
                                 // Ensure next track is downloading for instant skip
-                                let next = self.queue.get_queue_slice(0, 10);
+                                let next = self.queue.get_queue_slice(0, LOOKAHEAD_DOWNLOAD_COUNT);
                                 self.downloads
                                     .ensure_next_tracks_ready(&next, self.cookie_config());
 
-                                // Clean up later
+                                // Clean up the temp file after a delay
                                 let temp_path = temp_file_path.clone();
                                 tokio::spawn(async move {
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(
+                                        PLAYED_FILE_CLEANUP_DELAY_SECS,
+                                    ))
+                                    .await;
                                     let _ = std::fs::remove_file(&temp_path);
                                 });
                             }
@@ -694,633 +699,7 @@ impl MusicPlayerApp {
         }
     }
 
-    async fn perform_search(&mut self, query: &str) {
-        // Mark as searching
-        self.search.is_searching = true;
-
-        // Spawn background task for search
-        let extractor = YouTubeExtractor::new();
-        let query = query.to_string();
-        let tx = self.search_tx.clone();
-
-        tokio::spawn(async move {
-            match extractor.search(&query, 15).await {
-                Ok(results) => {
-                    let _ = tx.send(results);
-                }
-                Err(e) => {
-                    eprintln!("Search failed: {}", e);
-                    // Send empty results to unblock UI
-                    let _ = tx.send(Vec::new());
-                }
-            }
-        });
-    }
-
-    async fn play_next(&mut self) {
-        // CRITICAL: Clear pending state FIRST so navigation always works
-        self.pending_play_track = None;
-        self.currently_downloading = None;
-
-        if let Some(track) = self.queue.next() {
-            self.queue.limit_history(100);
-            self.play_track_from_cache_or_download(&track);
-        } else {
-            self.status_message = "Queue is empty!".to_string();
-        }
-    }
-
-    async fn play_previous(&mut self) {
-        // CRITICAL: Clear pending state FIRST so navigation always works
-        self.pending_play_track = None;
-        self.currently_downloading = None;
-
-        if let Some(track) = self.queue.previous() {
-            self.queue.limit_history(100);
-            self.play_track_from_cache_or_download(&track);
-        } else {
-            self.status_message = "No previous track!".to_string();
-        }
-    }
-
-    // ==========================================
-    // CENTRALIZED PLAY-FROM-CACHE-OR-DOWNLOAD
-    // ==========================================
-    // Single method that handles the "check cache -> play or download" logic.
-    // All play methods (play_next, play_previous, play_selected_queue_track,
-    // play_current_or_first) delegate to this to avoid duplication.
-    fn play_track_from_cache_or_download(&mut self, track: &Track) {
-        let cached_file = self.downloads.get_cached_file(&track.video_id);
-
-        if let Some(local_file) = cached_file {
-            if std::path::Path::new(&local_file).exists() {
-                self.player
-                    .play_with_duration(&local_file, &track.title, track.duration as f64);
-                self.status_message.clear();
-                let next = self.queue.get_queue_slice(0, 10);
-                self.downloads
-                    .ensure_next_tracks_ready(&next, self.cookie_config());
-            } else {
-                self.downloads.remove_from_cache(&track.video_id);
-                self.pending_play_track = Some(track.clone());
-                let cookie = self.cookie_config();
-                if self.downloads.spawn_download(track, cookie) {
-                    self.currently_downloading = Some(track.title.clone());
-                }
-            }
-        } else if is_allowed_youtube_url(&track.url) {
-            self.pending_play_track = Some(track.clone());
-            let cookie = self.cookie_config();
-            if self.downloads.spawn_download(track, cookie) {
-                self.currently_downloading = Some(track.title.clone());
-            }
-        } else {
-            self.status_message = "Cannot play non-YouTube URL".to_string();
-        }
-    }
-
-    fn spawn_download_with_limit(&self, track: &Track) -> bool {
-        self.downloads.spawn_download(track, self.cookie_config())
-    }
-
-    fn trigger_smart_downloads(&self) {
-        let next_tracks = self.queue.get_queue_slice(0, 10);
-        self.downloads
-            .ensure_next_tracks_ready(&next_tracks, self.cookie_config());
-    }
-
-    async fn toggle_pause_or_start(&mut self) {
-        // SMART SPACE BAR:
-        // 1. If in expanded queue -> play SELECTED track
-        // 2. If nothing playing and queue has tracks -> START FIRST TRACK
-        // 3. If player Stopped but track exists -> RELOAD and play current track
-        // 4. If something playing -> toggle pause/resume
-
-        if self.ui.queue_expanded && !self.queue.is_empty() {
-            // In expanded queue - play the SELECTED track!
-            self.play_selected_queue_track().await;
-        } else if self.queue.get_current().is_none() && !self.queue.is_empty() {
-            // Nothing playing but queue has tracks - START PLAYING!
-            self.play_current_or_first().await;
-        } else if self.player.get_state() == PlayerState::Stopped
-            && self.queue.get_current().is_some()
-        {
-            // Player stopped but track exists in queue - RELOAD IT!
-            self.play_current_or_first().await;
-        } else {
-            // Normal pause/resume
-            self.player.toggle_pause();
-        }
-    }
-
-    async fn play_selected_queue_track(&mut self) {
-        // CRITICAL: Clear pending state FIRST
-        self.pending_play_track = None;
-        self.currently_downloading = None;
-
-        // Play the track at selected_queue_item index
-        let queue_list = self.queue.get_queue_list();
-
-        if self.ui.selected_queue_item >= queue_list.len() {
-            self.status_message = "Invalid selection".to_string();
-            return;
-        }
-
-        let track = queue_list[self.ui.selected_queue_item].clone();
-
-        // Remove all tracks before and including selected from queue
-        // This makes the selected track the "current" one
-        for _ in 0..=self.ui.selected_queue_item {
-            self.queue.remove_at(0);
-        }
-
-        // Set as current track
-        self.queue
-            .restore_queue(self.queue.get_queue_list(), Some(track.clone()));
-
-        // Now play it
-        self.play_track_from_cache_or_download(&track);
-
-        // Collapse queue after selection
-        self.ui.queue_expanded = false;
-        self.ui.selected_queue_item = 0;
-    }
-
-    async fn play_current_or_first(&mut self) {
-        // CRITICAL: Clear pending state FIRST
-        self.pending_play_track = None;
-        self.currently_downloading = None;
-
-        // Play whatever is current, or start first track if nothing current
-        let track = if let Some(current) = self.queue.get_current().cloned() {
-            // Already have a current track, just play it
-            current
-        } else if let Some(first_track) = self.queue.start_or_next() {
-            // No current track, get first from queue
-            first_track
-        } else {
-            self.status_message = "Queue is empty!".to_string();
-            return;
-        };
-
-        // Play the track using centralized cache-or-download logic
-        self.play_track_from_cache_or_download(&track);
-    }
-
-    fn volume_up(&mut self, has_shift: bool) {
-        let current = self.player.get_volume();
-        let increment = if has_shift { 5 } else { 1 };
-        if current < 100 {
-            self.player.set_volume((current + increment).min(100));
-        }
-    }
-
-    fn volume_down(&mut self, has_shift: bool) {
-        let current = self.player.get_volume();
-        let decrement = if has_shift { 5 } else { 1 };
-        if current > 0 {
-            self.player.set_volume(current.saturating_sub(decrement));
-        }
-    }
-
-    fn seek_forward(&mut self) {
-        // Seek forward 10 seconds
-        self.player.seek_relative(10.0);
-        self.player.apply_seek();
-        self.status_message = format!("Seeked +10s ({})", format_time(self.player.get_time_pos()));
-    }
-
-    fn seek_backward(&mut self) {
-        // Seek backward 10 seconds
-        self.player.seek_relative(-10.0);
-        self.player.apply_seek();
-        self.status_message = format!("Seeked -10s ({})", format_time(self.player.get_time_pos()));
-    }
-
-    fn next_search_result(&mut self) {
-        if !self.search.results.is_empty() {
-            self.ui.selected_result = (self.ui.selected_result + 1) % self.search.results.len();
-        }
-    }
-
-    fn prev_search_result(&mut self) {
-        if !self.search.results.is_empty() {
-            if self.ui.selected_result == 0 {
-                self.ui.selected_result = self.search.results.len() - 1;
-            } else {
-                self.ui.selected_result -= 1;
-            }
-        }
-    }
-
-    fn next_queue_item(&mut self) {
-        let queue_len = self.queue.len();
-        if queue_len > 0 {
-            self.ui.selected_queue_item = (self.ui.selected_queue_item + 1) % queue_len;
-            // HOVER DOWNLOAD: Start downloading this track immediately!
-            self.trigger_hover_download(self.ui.selected_queue_item);
-        }
-    }
-
-    fn prev_queue_item(&mut self) {
-        let queue_len = self.queue.len();
-        if queue_len > 0 {
-            if self.ui.selected_queue_item == 0 {
-                self.ui.selected_queue_item = queue_len - 1;
-            } else {
-                self.ui.selected_queue_item -= 1;
-            }
-            // HOVER DOWNLOAD: Start downloading this track immediately!
-            self.trigger_hover_download(self.ui.selected_queue_item);
-        }
-    }
-
-    fn trigger_hover_download(&self, index: usize) {
-        let queue_slice = self.queue.get_queue_slice(index + 15, 1);
-        self.downloads
-            .trigger_hover_download(&queue_slice, self.cookie_config());
-    }
-
-    fn delete_selected_queue_item(&mut self) {
-        if self.ui.queue_expanded && !self.queue.is_empty() {
-            if let Some(removed_track) = self.queue.remove_at(self.ui.selected_queue_item) {
-                let clean_title = clean_title(&removed_track.title);
-                self.status_message = format!("Removed '{}' from queue", clean_title);
-
-                // Adjust selection if needed
-                let queue_len = self.queue.len();
-                if queue_len == 0 {
-                    self.ui.selected_queue_item = 0;
-                } else if self.ui.selected_queue_item >= queue_len {
-                    self.ui.selected_queue_item = queue_len - 1;
-                }
-
-                // Don't save on every action - only on exit
-                // self.save_queue_async();
-            }
-        } else if !self.ui.queue_expanded {
-            self.status_message = "Press 't' to expand queue first".to_string();
-        }
-    }
-
-    fn next_mix_item(&mut self) {
-        if !self.playlist.my_mix_playlists.is_empty() {
-            self.ui.selected_mix_item =
-                (self.ui.selected_mix_item + 1) % self.playlist.my_mix_playlists.len();
-        }
-    }
-
-    fn prev_mix_item(&mut self) {
-        if !self.playlist.my_mix_playlists.is_empty() {
-            if self.ui.selected_mix_item == 0 {
-                self.ui.selected_mix_item = self.playlist.my_mix_playlists.len() - 1;
-            } else {
-                self.ui.selected_mix_item -= 1;
-            }
-        }
-    }
-
-    fn next_history_item(&mut self) {
-        let history_len = self.queue.get_history().len();
-        if history_len > 0 {
-            self.ui.selected_history_item = (self.ui.selected_history_item + 1) % history_len;
-        }
-    }
-
-    fn prev_history_item(&mut self) {
-        let history_len = self.queue.get_history().len();
-        if history_len > 0 {
-            if self.ui.selected_history_item == 0 {
-                self.ui.selected_history_item = history_len - 1;
-            } else {
-                self.ui.selected_history_item -= 1;
-            }
-        }
-    }
-
-    fn clear_history(&mut self) {
-        let count = self.queue.get_history().len();
-        self.queue.clear_history();
-        self.ui.selected_history_item = 0;
-        self.status_message = format!("Cleared {} tracks from history", count);
-
-        // Save to disk
-        if let Err(e) = self.save_history() {
-            self.status_message = format!("History cleared but failed to save: {}", e);
-        }
-    }
-
-    fn delete_selected_history_item(&mut self) {
-        let history_len = self.queue.get_history().len();
-        if history_len == 0 {
-            return;
-        }
-
-        if let Some(removed) = self.queue.remove_history_at(self.ui.selected_history_item) {
-            let title = clean_title(&removed.title);
-            self.status_message = format!("Removed '{}' from history", title);
-
-            // Adjust selection
-            let new_len = self.queue.get_history().len();
-            if new_len == 0 {
-                self.ui.selected_history_item = 0;
-            } else if self.ui.selected_history_item >= new_len {
-                self.ui.selected_history_item = new_len - 1;
-            }
-
-            // Save to disk
-            if let Err(e) = self.save_history() {
-                self.status_message = format!("Removed from history but save failed: {}", e);
-            }
-        }
-    }
-
-    async fn load_playlist_from_url(&mut self, url: &str) {
-        // Validate URL is a known YouTube domain before passing to yt-dlp
-        if !is_allowed_youtube_url(url) {
-            self.status_message = "Invalid URL: must be a YouTube or YouTube Music URL".to_string();
-            return;
-        }
-
-        self.status_message = "Loading playlist... (this may take a moment)".to_string();
-
-        // Yield to allow UI to render the loading message before blocking fetch
-        tokio::task::yield_now().await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        let cookie_config = self
-            .browser_auth
-            .load_selected_account()
-            .map(|account| self.browser_auth.get_cookie_arg(&account));
-
-        let playlist_url = url.to_string();
-        let fetch_result = tokio::task::spawn_blocking(move || {
-            crate::services::playlist::fetch_playlist_tracks(&playlist_url, cookie_config)
-        })
-        .await;
-
-        match fetch_result {
-            Ok(Ok(tracks)) => {
-                if tracks.is_empty() {
-                    self.status_message = "No tracks found in playlist".to_string();
-                    return;
-                }
-
-                let track_count = tracks.len();
-
-                self.playlist.loaded_name = format!("Loaded Playlist ({} tracks)", track_count);
-
-                // Add tracks to queue (filter out tracks > 5 minutes)
-                let mut added_count = 0;
-                let mut filtered_count = 0;
-                for track in &tracks {
-                    if track.duration <= MAX_TRACK_DURATION_SECS {
-                        self.queue.add(track.clone());
-                        added_count += 1;
-                    } else {
-                        filtered_count += 1;
-                    }
-                }
-
-                // Store loaded playlist for display (moved after iteration to avoid clone)
-                self.playlist.loaded_tracks = tracks;
-
-                // Trigger smart downloads - downloads next 15 + previous 5
-                self.trigger_smart_downloads();
-
-                if filtered_count > 0 {
-                    self.status_message = format!(
-                        "Added {} tracks to queue ({} long tracks filtered out)",
-                        added_count, filtered_count
-                    );
-                } else {
-                    self.status_message = format!("Added {} tracks to queue", added_count);
-                }
-
-                // Don't save on every action - only on exit
-                // self.save_queue_async();
-            }
-            Ok(Err(e)) => {
-                self.status_message = format!("Failed to fetch playlist: {}", e);
-            }
-            Err(e) => {
-                self.status_message = format!("Task error: {}", e);
-            }
-        }
-    }
-
-    async fn add_selected_mix_to_queue(&mut self) {
-        if let Some(mix) = self
-            .playlist
-            .my_mix_playlists
-            .get(self.ui.selected_mix_item)
-            .cloned()
-        {
-            self.status_message = format!(
-                "⏳ Fetching tracks from '{}'... (this may take a moment)",
-                mix.title
-            );
-
-            // Yield to allow UI to render the loading message before blocking fetch
-            tokio::task::yield_now().await;
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-            let cookie_config = self
-                .browser_auth
-                .load_selected_account()
-                .map(|account| self.browser_auth.get_cookie_arg(&account));
-
-            let playlist_url = mix.url.clone();
-            let fetch_result = tokio::task::spawn_blocking(move || {
-                crate::services::playlist::fetch_playlist_tracks(&playlist_url, cookie_config)
-            })
-            .await;
-
-            match fetch_result {
-                Ok(Ok(tracks)) => {
-                    if tracks.is_empty() {
-                        self.status_message = format!("No tracks found in '{}'", mix.title);
-                        return;
-                    }
-
-                    // Add tracks to queue (filter out tracks > 5 minutes = 300 seconds)
-                    let mut added_count = 0;
-                    let mut filtered_count = 0;
-                    for track in tracks {
-                        if track.duration <= MAX_TRACK_DURATION_SECS {
-                            self.queue.add(track);
-                            added_count += 1;
-                        } else {
-                            filtered_count += 1;
-                        }
-                    }
-
-                    // Trigger smart downloads - downloads next 15 + previous 5
-                    self.trigger_smart_downloads();
-
-                    if filtered_count > 0 {
-                        self.status_message = format!(
-                            "Added {} tracks from '{}' ({} long tracks filtered out)",
-                            added_count, mix.title, filtered_count
-                        );
-                    } else {
-                        self.status_message =
-                            format!("Added {} tracks from '{}' to queue", added_count, mix.title);
-                    }
-
-                    // Save queue to disk
-                    if let Err(e) = self.save_queue() {
-                        eprintln!("Failed to save queue: {}", e);
-                    }
-                }
-                Ok(Err(e)) => {
-                    self.status_message = format!("Failed to fetch tracks: {}", e);
-                }
-                Err(e) => {
-                    self.status_message = format!("Task error: {}", e);
-                }
-            }
-        }
-    }
-
-    async fn refresh_my_mix(&mut self) {
-        self.status_message = "Refreshing My Mix playlists...".to_string();
-        self.fetch_my_mix().await;
-    }
-
-    async fn fetch_my_mix(&mut self) {
-        // Fetch My Mix playlists using yt-dlp
-        let cookie_config = self
-            .browser_auth
-            .load_selected_account()
-            .map(|account| self.browser_auth.get_cookie_arg(&account));
-
-        let fetch_result = tokio::task::spawn_blocking(move || {
-            crate::services::playlist::fetch_my_mix(cookie_config)
-        })
-        .await;
-
-        match fetch_result {
-            Ok(Ok(playlists)) => {
-                if playlists.is_empty() {
-                    self.status_message = "No My Mix playlists found".to_string();
-                } else {
-                    self.playlist.my_mix_playlists = playlists;
-                    self.status_message = format!(
-                        "Loaded {} My Mix playlists",
-                        self.playlist.my_mix_playlists.len()
-                    );
-                }
-            }
-            Ok(Err(e)) => {
-                self.status_message = format!("Failed to fetch My Mix: {}", e);
-                // Keep existing playlists if any
-            }
-            Err(e) => {
-                self.status_message = format!("Task error: {}", e);
-            }
-        }
-    }
-
-    fn add_selected_to_queue(&mut self) {
-        if let Some(video) = self.search.results.get(self.ui.selected_result) {
-            // Filter out tracks > 5 minutes (300 seconds) - this is a music player!
-            if video.duration > MAX_TRACK_DURATION_SECS {
-                let clean_title = clean_title(&video.title);
-                let mins = video.duration / 60;
-                self.status_message = format!(
-                    "'{}' is too long ({}min) - music only (<5min)",
-                    clean_title, mins
-                );
-                return;
-            }
-
-            let track = Track::new(
-                video.id.clone(),
-                video.title.clone(),
-                video.duration,
-                video.uploader.clone(),
-                video.url.clone(),
-            );
-
-            let was_empty = self.queue.is_empty();
-
-            // Start background download through centralized rate-limited system
-            self.spawn_download_with_limit(&track);
-
-            self.queue.add(track);
-
-            // Show feedback
-            let clean_title = clean_title(&video.title);
-            self.status_message = format!(
-                "Added '{}' to queue! Downloading in background... ({} total)",
-                clean_title,
-                self.queue.len()
-            );
-
-            if was_empty {
-                self.status_message =
-                    format!("Added '{}' to queue! Press 'n' to play", clean_title);
-            }
-
-            // Save queue to disk
-            if let Err(e) = self.save_queue() {
-                eprintln!("Failed to save queue: {}", e);
-            }
-        }
-    }
-
-    async fn start_login(&mut self) {
-        self.status_message = "Detecting YouTube accounts from browsers...".to_string();
-
-        // Detect available accounts from Chrome/Firefox/Zen
-        self.available_accounts = self.browser_auth.detect_accounts();
-
-        if self.available_accounts.is_empty() {
-            self.status_message =
-                "No browser accounts found. Please login to YouTube in Chrome or Firefox first."
-                    .to_string();
-        } else {
-            self.status_message = format!(
-                "Found {} account(s). Select one:",
-                self.available_accounts.len()
-            );
-            self.ui.selected_account_idx = 0;
-            self.mode = AppMode::AccountPicker;
-        }
-    }
-
-    fn next_account(&mut self) {
-        if !self.available_accounts.is_empty() {
-            self.ui.selected_account_idx =
-                (self.ui.selected_account_idx + 1) % self.available_accounts.len();
-        }
-    }
-
-    fn prev_account(&mut self) {
-        if !self.available_accounts.is_empty() {
-            if self.ui.selected_account_idx == 0 {
-                self.ui.selected_account_idx = self.available_accounts.len() - 1;
-            } else {
-                self.ui.selected_account_idx -= 1;
-            }
-        }
-    }
-
-    async fn select_account(&mut self) {
-        if let Some(account) = self.available_accounts.get(self.ui.selected_account_idx) {
-            match self.browser_auth.save_selected_account(account) {
-                Ok(_) => {
-                    self.status_message = format!(
-                        "✓ Logged in as {} - Press '/' to search for music!",
-                        account.display_name
-                    );
-                    self.mode = AppMode::Normal;
-                }
-                Err(e) => {
-                    self.status_message = format!("Failed to save account: {}", e);
-                }
-            }
-        }
-    }
+    // Playback methods: see ui/playback.rs
+    // Navigation methods: see ui/navigation.rs
+    // Action methods (search, playlist, login): see ui/actions.rs
 }
