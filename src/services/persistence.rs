@@ -209,6 +209,47 @@ impl PersistenceService {
 
         Ok(())
     }
+
+    // -- Playback state (resume position) -----------------------------------
+
+    /// Save the current playback position so it can be resumed on restart.
+    pub(crate) fn save_playback_state(&self, state: &PlaybackState) -> Result<()> {
+        fs::create_dir_all(&self.config_dir).context("Failed to create config directory")?;
+
+        let path = self.config_dir.join("playback_state.json");
+        let json = serde_json::to_string(state).context("Failed to serialize playback state")?;
+        fs::write(&path, json).context("Failed to write playback state")?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+
+        Ok(())
+    }
+
+    /// Load the saved playback state, if any.
+    pub(crate) fn load_playback_state(&self) -> Option<PlaybackState> {
+        let path = self.config_dir.join("playback_state.json");
+        let data = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    /// Remove the saved playback state (e.g. when track finishes naturally).
+    pub(crate) fn clear_playback_state(&self) {
+        let path = self.config_dir.join("playback_state.json");
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Saved playback position for resume-on-restart.
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub(crate) struct PlaybackState {
+    pub video_id: String,
+    pub position_secs: f64,
+    pub title: String,
+    pub duration: f64,
 }
 
 // -- History search/filter ----------------------------------------------

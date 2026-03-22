@@ -253,6 +253,7 @@ impl MusicPlayerApp {
             if !queue_load_triggered {
                 queue_load_triggered = true;
                 self.load_queue_async().await;
+                self.try_resume_playback();
             }
 
             // Only render if enough time has passed (frame rate limiting)
@@ -358,6 +359,8 @@ impl MusicPlayerApp {
             // IMPORTANT: Only auto-advance when state is Playing (not Loading, Stopped, or Paused)
             // This prevents race condition where sink is empty during track loading
             if self.player.is_finished() && self.player.get_state() == PlayerState::Playing {
+                // Track finished naturally — clear saved resume state
+                self.persistence.clear_playback_state();
                 if !self.queue.is_empty() {
                     self.status_message = "Track finished, playing next...".to_string();
                     self.play_next().await;
@@ -387,6 +390,22 @@ impl MusicPlayerApp {
         // Abort all background download tasks before saving
         self.downloads.abort_all();
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Save playback position for resume-on-restart
+        if let Some(current) = self.queue.get_current() {
+            let pos = self.player.get_time_pos();
+            if pos > 1.0 {
+                let state = crate::services::persistence::PlaybackState {
+                    video_id: current.video_id.clone(),
+                    position_secs: pos,
+                    title: current.title.clone(),
+                    duration: current.duration as f64,
+                };
+                let _ = self.persistence.save_playback_state(&state);
+            }
+        } else {
+            self.persistence.clear_playback_state();
+        }
 
         // Save history, queue, and download cache before quitting
         if let Err(e) = self.save_history() {

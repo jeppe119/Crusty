@@ -187,4 +187,40 @@ impl MusicPlayerApp {
         self.player.apply_seek();
         self.status_message = format!("Seeked -10s ({})", format_time(self.player.get_time_pos()));
     }
+
+    /// Resume playback from saved state if a matching cached file exists.
+    pub(super) fn try_resume_playback(&mut self) {
+        let Some(saved) = self.persistence.load_playback_state() else {
+            return;
+        };
+
+        // Check if the track is still in the download cache
+        let Some(file_path) = self.downloads.get_cached_file(&saved.video_id) else {
+            return;
+        };
+
+        // Verify the file still exists on disk
+        if !std::path::Path::new(&file_path).exists() {
+            return;
+        }
+
+        // Play the track from cache
+        self.player
+            .play_with_duration(&file_path, &saved.title, saved.duration);
+
+        // Seek to the saved position
+        if saved.position_secs > 1.0 {
+            self.player.seek(saved.position_secs);
+            self.player.apply_seek();
+        }
+
+        self.status_message = format!(
+            "Resumed '{}' at {}",
+            saved.title,
+            format_time(saved.position_secs)
+        );
+
+        // Clear the saved state so it doesn't re-trigger
+        self.persistence.clear_playback_state();
+    }
 }
