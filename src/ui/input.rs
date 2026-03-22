@@ -37,6 +37,7 @@ pub(crate) enum AppCommand {
     ToggleQueueExpand,
     ToggleHistoryExpand,
     ToggleMixExpand,
+    ToggleMusicOnlyMode,
     RefreshMix,
     Delete,
     ClearHistory,
@@ -125,6 +126,7 @@ pub(crate) fn key_to_command(key: KeyEvent, ctx: &InputContext<'_>) -> Option<Ap
             KeyCode::Char('m') if has_shift => Some(AppCommand::RefreshMix),
             KeyCode::Char('M') => Some(AppCommand::RefreshMix),
             KeyCode::Char('m') => Some(AppCommand::ToggleMixExpand),
+            KeyCode::Char('f') => Some(AppCommand::ToggleMusicOnlyMode),
             KeyCode::Char('d') | KeyCode::Char('D') => Some(AppCommand::Delete),
             KeyCode::Char('c') | KeyCode::Char('C') if has_shift && ctx.history_expanded => {
                 Some(AppCommand::ClearHistory)

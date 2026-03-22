@@ -67,11 +67,11 @@ impl MusicPlayerApp {
 
                 self.playlist.loaded_name = format!("Loaded Playlist ({} tracks)", track_count);
 
-                // Add tracks to queue (filter out tracks > 5 minutes)
+                // Add tracks to queue (filter long tracks in music-only mode)
                 let mut added_count = 0;
                 let mut filtered_count = 0;
                 for track in &tracks {
-                    if track.duration <= MAX_TRACK_DURATION_SECS {
+                    if !self.ui.music_only_mode || track.duration <= MAX_TRACK_DURATION_SECS {
                         self.queue.add(track.clone());
                         added_count += 1;
                     } else {
@@ -87,7 +87,7 @@ impl MusicPlayerApp {
 
                 if filtered_count > 0 {
                     self.status_message = format!(
-                        "Added {} tracks to queue ({} long tracks filtered out)",
+                        "Added {} tracks to queue ({} filtered — press 'f' to allow all)",
                         added_count, filtered_count
                     );
                 } else {
@@ -137,11 +137,11 @@ impl MusicPlayerApp {
                         return;
                     }
 
-                    // Add tracks to queue (filter out long tracks)
+                    // Add tracks to queue (filter long tracks in music-only mode)
                     let mut added_count = 0;
                     let mut filtered_count = 0;
                     for track in tracks {
-                        if track.duration <= MAX_TRACK_DURATION_SECS {
+                        if !self.ui.music_only_mode || track.duration <= MAX_TRACK_DURATION_SECS {
                             self.queue.add(track);
                             added_count += 1;
                         } else {
@@ -154,7 +154,7 @@ impl MusicPlayerApp {
 
                     if filtered_count > 0 {
                         self.status_message = format!(
-                            "Added {} tracks from '{}' ({} long tracks filtered out)",
+                            "Added {} from '{}' ({} filtered — press 'f' to allow all)",
                             added_count, mix.title, filtered_count
                         );
                     } else {
@@ -219,12 +219,12 @@ impl MusicPlayerApp {
 
     pub(super) fn add_selected_to_queue(&mut self) {
         if let Some(video) = self.search.results.get(self.ui.selected_result) {
-            // Filter out tracks > 5 minutes (300 seconds) - this is a music player!
-            if video.duration > MAX_TRACK_DURATION_SECS {
+            // In music-only mode, filter out tracks > 5 minutes
+            if self.ui.music_only_mode && video.duration > MAX_TRACK_DURATION_SECS {
                 let clean_title = clean_title(&video.title);
                 let mins = video.duration / 60;
                 self.status_message = format!(
-                    "'{}' is too long ({}min) - music only (<5min)",
+                    "'{}' is too long ({}min) — press 'f' to allow all content",
                     clean_title, mins
                 );
                 return;

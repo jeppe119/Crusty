@@ -642,6 +642,14 @@ impl MusicPlayerApp {
                     self.refresh_my_mix().await;
                 }
             }
+            AppCommand::ToggleMusicOnlyMode => {
+                self.ui.music_only_mode = !self.ui.music_only_mode;
+                self.status_message = if self.ui.music_only_mode {
+                    "Music mode ON (tracks >5min filtered)".to_string()
+                } else {
+                    "All content mode (no duration filter)".to_string()
+                };
+            }
             AppCommand::Delete => {
                 if self.ui.history_expanded {
                     self.delete_selected_history_item();

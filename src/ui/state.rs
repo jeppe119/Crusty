@@ -53,6 +53,7 @@ pub(crate) struct UiState {
     pub animation_frame: u8,
     pub title_scroll_offset: usize,
     pub last_animation_update: std::time::Instant,
+    pub music_only_mode: bool,
 }
 
 impl Default for UiState {
@@ -70,6 +71,7 @@ impl Default for UiState {
             animation_frame: 0,
             title_scroll_offset: 0,
             last_animation_update: std::time::Instant::now(),
+            music_only_mode: true,
         }
     }
 }

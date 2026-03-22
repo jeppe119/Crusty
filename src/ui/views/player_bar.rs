@@ -124,11 +124,17 @@ pub(crate) fn draw_player_compact(app: &MusicPlayerApp, frame: &mut Frame, area:
     };
 
     let volume = app.player.get_volume();
+    let mode_str = if app.ui.music_only_mode {
+        "Music"
+    } else {
+        "All"
+    };
     let status_line = format!(
-        "{} | Vol: {}% | Queue: {} tracks",
+        "{} | Vol: {}% | Queue: {} tracks | [{}]",
         state_str,
         volume,
-        app.queue.len()
+        app.queue.len(),
+        mode_str
     );
 
     // Combine all 3 lines inside single Player box
