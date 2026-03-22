@@ -27,97 +27,44 @@ use crate::config::{
 };
 use crate::player::audio::{AudioPlayer, PlayerState};
 use crate::player::queue::{Queue, Track};
+use crate::ui::state::{
+    AppMode, MixPlaylist, PlaylistState, QueueState, SearchState, UiState, ViewMode,
+};
 use crate::youtube::browser_auth::{BrowserAccount, BrowserAuth};
 use crate::youtube::extractor::{self, VideoInfo, YouTubeExtractor};
 
-#[derive(Debug, PartialEq)]
-enum AppMode {
-    Normal,
-    Searching,
-    LoginPrompt,     // Show login screen
-    AccountPicker,   // Show list of browser accounts
-    Help,            // Show help screen with keybinds
-    LoadingPlaylist, // Loading playlist from URL
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ViewMode {
-    Home,   // Showing My Mix | History
-    Search, // Showing Search Results | History
-}
-
-#[derive(Debug, Clone)]
-struct MixPlaylist {
-    title: String,
-    track_count: usize,
-    url: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct QueueState {
-    tracks: Vec<Track>,
-    current_track: Option<Track>,
-}
-
 pub struct MusicPlayerApp {
+    // Core modules
     player: AudioPlayer,
     queue: Queue,
     browser_auth: BrowserAuth,
     available_accounts: Vec<BrowserAccount>,
-    selected_account_idx: usize,
-    search_results: Vec<VideoInfo>,
-    selected_result: usize,
-    selected_queue_item: usize,
-    search_query: String,
-    playlist_url: String,
+
+    // UI state (sub-structs)
+    ui: UiState,
+    search: SearchState,
+    playlist: PlaylistState,
     mode: AppMode,
-    should_quit: bool,
-    is_searching: bool,
-    search_rx: mpsc::UnboundedReceiver<Vec<VideoInfo>>,
-    search_tx: mpsc::UnboundedSender<Vec<VideoInfo>>,
-    status_message: String,
-    // Track pre-downloaded files by video_id
-    downloaded_files: Arc<Mutex<HashMap<String, String>>>,
-    // Track failed downloads by video_id
-    failed_downloads: Arc<Mutex<HashMap<String, String>>>,
-    // Queue view expansion toggle
-    queue_expanded: bool,
-    // View tracking
     current_view: ViewMode,
     previous_view: ViewMode,
-    // My Mix
-    my_mix_playlists: Vec<MixPlaylist>,
-    my_mix_expanded: bool,
-    selected_mix_item: usize,
-    // Playlist loading expansion
-    playlist_loading_expanded: bool,
-    // Loaded playlists
-    loaded_playlist_tracks: Vec<Track>,
-    loaded_playlist_name: String,
-    // History
-    history_expanded: bool,
-    selected_history_item: usize,
-    // Queue loading state
+    should_quit: bool,
+    status_message: String,
     queue_loaded: bool,
-    // Download notification channel
-    download_rx: mpsc::UnboundedReceiver<(String, Result<String, String>)>, // (video_id, result)
+
+    // Async channels
+    search_rx: mpsc::UnboundedReceiver<Vec<VideoInfo>>,
+    search_tx: mpsc::UnboundedSender<Vec<VideoInfo>>,
+    download_rx: mpsc::UnboundedReceiver<(String, Result<String, String>)>,
     download_tx: mpsc::UnboundedSender<(String, Result<String, String>)>,
-    // Track being downloaded to play next
-    pending_play_track: Option<Track>,
-    // Track currently being downloaded (for progress display)
-    currently_downloading: Option<String>, // track title
-    // Active download count (for rate limiting)
+
+    // Download state
+    downloaded_files: Arc<Mutex<HashMap<String, String>>>,
+    failed_downloads: Arc<Mutex<HashMap<String, String>>>,
     active_downloads: Arc<Mutex<usize>>,
-    // Track which video_ids are currently downloading (prevents duplicate downloads on SPACE spam)
     downloading_videos: Arc<Mutex<std::collections::HashSet<String>>>,
-    // Animation frame counter for download indicator
-    animation_frame: u8,
-    // Title scroll position for rotating long titles
-    title_scroll_offset: usize,
-    // Track background download tasks for proper cleanup
     background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    // Time-based animation tracking (prevents mouse movement from speeding up animations)
-    last_animation_update: std::time::Instant,
+    pending_play_track: Option<Track>,
+    currently_downloading: Option<String>,
 }
 
 impl MusicPlayerApp {
@@ -170,49 +117,33 @@ impl MusicPlayerApp {
             queue,
             browser_auth,
             available_accounts: Vec::new(),
-            selected_account_idx: 0,
-            search_results: Vec::new(),
-            selected_result: 0,
-            selected_queue_item: 0,
-            search_query: String::new(),
-            playlist_url: String::new(),
+            ui: UiState::default(),
+            search: SearchState::default(),
+            playlist: PlaylistState::default(),
             mode: initial_mode,
-            should_quit: false,
-            is_searching: false,
-            search_rx,
-            search_tx,
-            status_message,
-            downloaded_files: Arc::new(Mutex::new(HashMap::new())),
-            failed_downloads: Arc::new(Mutex::new(HashMap::new())),
-            queue_expanded: false,
             current_view: ViewMode::Home,
             previous_view: ViewMode::Home,
-            my_mix_playlists: Vec::new(),
-            my_mix_expanded: false,
-            selected_mix_item: 0,
-            playlist_loading_expanded: false,
-            loaded_playlist_tracks: Vec::new(),
-            loaded_playlist_name: String::new(),
-            history_expanded: false,
-            selected_history_item: 0,
+            should_quit: false,
+            status_message,
             queue_loaded: false,
+            search_rx,
+            search_tx,
             download_rx,
             download_tx,
-            pending_play_track: None,
-            currently_downloading: None,
+            downloaded_files: Arc::new(Mutex::new(HashMap::new())),
+            failed_downloads: Arc::new(Mutex::new(HashMap::new())),
             active_downloads: Arc::new(Mutex::new(0)),
             downloading_videos: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            animation_frame: 0,
-            title_scroll_offset: 0,
             background_tasks: Arc::new(Mutex::new(Vec::new())),
-            last_animation_update: std::time::Instant::now(),
+            pending_play_track: None,
+            currently_downloading: None,
         })
     }
 
     // Get animated download indicator (Pac-Man style)
     fn get_download_animation(&self) -> &'static str {
         // Animate every 8 frames (slower animation)
-        let frame = (self.animation_frame / 8) % 4;
+        let frame = (self.ui.animation_frame / 8) % 4;
         match frame {
             0 => "ᗧ··· ", // Pac-Man open
             1 => "·ᗧ·· ", // Moving right
@@ -447,21 +378,21 @@ impl MusicPlayerApp {
             // Time-based animation updates (prevents mouse movement from speeding up animations)
             // Update animations at much slower rate for subtle, non-distracting effect
             let animation_interval = std::time::Duration::from_millis(150); // ~6.6 FPS for subtle animations
-            if now.duration_since(self.last_animation_update) >= animation_interval {
-                self.animation_frame = self.animation_frame.wrapping_add(1);
+            if now.duration_since(self.ui.last_animation_update) >= animation_interval {
+                self.ui.animation_frame = self.ui.animation_frame.wrapping_add(1);
 
                 // Scroll title text slowly for readability
-                self.title_scroll_offset = self.title_scroll_offset.wrapping_add(1);
+                self.ui.title_scroll_offset = self.ui.title_scroll_offset.wrapping_add(1);
 
-                self.last_animation_update = now;
+                self.ui.last_animation_update = now;
             }
 
             // Check for search results
             if let Ok(results) = self.search_rx.try_recv() {
-                self.search_results = results;
-                self.selected_result = 0;
-                self.is_searching = false;
-                self.status_message = format!("Found {} results", self.search_results.len());
+                self.search.results = results;
+                self.ui.selected_result = 0;
+                self.search.is_searching = false;
+                self.status_message = format!("Found {} results", self.search.results.len());
             }
 
             // Check for completed downloads
@@ -631,16 +562,16 @@ impl MusicPlayerApp {
             .split(frame.area());
 
         // Header
-        let title = if self.is_searching {
+        let title = if self.search.is_searching {
             "Searching... please wait".to_string()
         } else if !self.status_message.is_empty() {
             self.status_message.clone()
         } else {
             match self.mode {
-                AppMode::Searching => format!("🔍 SEARCH MODE: {}_", self.search_query),
+                AppMode::Searching => format!("🔍 SEARCH MODE: {}_", self.search.query),
                 AppMode::LoadingPlaylist => format!(
                     "📋 PASTE PLAYLIST URL: {}_  (Press Enter to load, Esc to cancel)",
-                    self.playlist_url
+                    self.playlist.url
                 ),
                 AppMode::Normal => {
                     let account_info =
@@ -664,16 +595,16 @@ impl MusicPlayerApp {
         frame.render_widget(header, chunks[0]);
 
         // Main area layout depends on queue expansion, my mix expansion, history expansion, or view mode
-        if self.queue_expanded {
+        if self.ui.queue_expanded {
             // Queue expanded: Queue takes full main area
             self.draw_queue_expanded(frame, chunks[1]);
-        } else if self.my_mix_expanded {
+        } else if self.ui.my_mix_expanded {
             // My Mix expanded: My Mix takes full main area
             self.draw_my_mix_expanded(frame, chunks[1]);
-        } else if self.history_expanded {
+        } else if self.ui.history_expanded {
             // History expanded: History takes full main area
             self.draw_history_expanded(frame, chunks[1]);
-        } else if self.playlist_loading_expanded {
+        } else if self.ui.playlist_loading_expanded {
             // Playlist loading expanded: Show URL input interface
             self.draw_playlist_loading_expanded(frame, chunks[1]);
         } else if self.current_view == ViewMode::Search || matches!(self.mode, AppMode::Searching) {
@@ -713,12 +644,13 @@ impl MusicPlayerApp {
 
     fn draw_search_results(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let results: Vec<ListItem> = self
-            .search_results
+            .search
+            .results
             .iter()
             .enumerate()
             .map(|(i, video)| {
                 let content = video.title.clone();
-                let style = if i == self.selected_result {
+                let style = if i == self.ui.selected_result {
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
@@ -787,7 +719,7 @@ impl MusicPlayerApp {
             (0, total_tracks)
         } else {
             // Calculate scrolling window
-            let start = self.selected_queue_item.saturating_sub(half_window);
+            let start = self.ui.selected_queue_item.saturating_sub(half_window);
             let end = (start + visible_height).min(total_tracks);
 
             // Adjust if we're at the end
@@ -808,7 +740,7 @@ impl MusicPlayerApp {
             .map(|(i, track)| {
                 let actual_idx = start_idx + i;
                 let content = format!("{}. {}", actual_idx + 1, &track.title);
-                let style = if actual_idx == self.selected_queue_item {
+                let style = if actual_idx == self.ui.selected_queue_item {
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD)
@@ -875,7 +807,7 @@ impl MusicPlayerApp {
         let (start_idx, end_idx) = if total_history <= visible_height {
             (0, total_history)
         } else {
-            let start = self.selected_history_item.saturating_sub(half_window);
+            let start = self.ui.selected_history_item.saturating_sub(half_window);
             let end = (start + visible_height).min(total_history);
             if end == total_history && total_history > visible_height {
                 (total_history - visible_height, total_history)
@@ -893,7 +825,7 @@ impl MusicPlayerApp {
             .take(end_idx - start_idx)
             .map(|(i, track)| {
                 let content = format!("{}. {}", i + 1, &track.title);
-                let style = if i == self.selected_history_item {
+                let style = if i == self.ui.selected_history_item {
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
@@ -921,9 +853,10 @@ impl MusicPlayerApp {
     }
 
     fn draw_my_mix(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let mix_items: Vec<ListItem> = if !self.loaded_playlist_tracks.is_empty() {
+        let mix_items: Vec<ListItem> = if !self.playlist.loaded_tracks.is_empty() {
             // Show first 50 tracks from loaded playlist
-            self.loaded_playlist_tracks
+            self.playlist
+                .loaded_tracks
                 .iter()
                 .take(50)
                 .enumerate()
@@ -933,7 +866,7 @@ impl MusicPlayerApp {
                     ListItem::new(content).style(Style::default().fg(Color::White))
                 })
                 .collect()
-        } else if self.my_mix_playlists.is_empty() {
+        } else if self.playlist.my_mix_playlists.is_empty() {
             vec![
                 ListItem::new("Press 'l' to load a playlist URL")
                     .style(Style::default().fg(Color::Yellow)),
@@ -941,7 +874,8 @@ impl MusicPlayerApp {
                 ListItem::new("YouTube Music playlists supported!"),
             ]
         } else {
-            self.my_mix_playlists
+            self.playlist
+                .my_mix_playlists
                 .iter()
                 .enumerate()
                 .map(|(i, mix)| {
@@ -950,7 +884,7 @@ impl MusicPlayerApp {
                     } else {
                         mix.title.clone()
                     };
-                    let style = if i == self.selected_mix_item {
+                    let style = if i == self.ui.selected_mix_item {
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD)
@@ -962,8 +896,8 @@ impl MusicPlayerApp {
                 .collect()
         };
 
-        let title = if !self.loaded_playlist_name.is_empty() {
-            format!("{} - Press [l] to load another", self.loaded_playlist_name)
+        let title = if !self.playlist.loaded_name.is_empty() {
+            format!("{} - Press [l] to load another", self.playlist.loaded_name)
         } else {
             "Playlists - Press [l] to load playlist URL".to_string()
         };
@@ -975,12 +909,13 @@ impl MusicPlayerApp {
 
     fn draw_my_mix_expanded(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let mix_items: Vec<ListItem> = self
+            .playlist
             .my_mix_playlists
             .iter()
             .enumerate()
             .map(|(i, mix)| {
                 let content = format!("{}. {} ({} tracks)", i + 1, mix.title, mix.track_count);
-                let style = if i == self.selected_mix_item {
+                let style = if i == self.ui.selected_mix_item {
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
@@ -1003,7 +938,7 @@ impl MusicPlayerApp {
             "",
             "Paste your YouTube or YouTube Music playlist URL below:",
             "",
-            &format!("URL: {}_", self.playlist_url),
+            &format!("URL: {}_", self.playlist.url),
             "",
             "",
             "Instructions:",
@@ -1042,7 +977,7 @@ impl MusicPlayerApp {
 
             // Scroll text if too long (more than 80 chars)
             if full_text.len() > 80 {
-                let raw_scroll_pos = self.title_scroll_offset % full_text.len();
+                let raw_scroll_pos = self.ui.title_scroll_offset % full_text.len();
                 // Ensure we slice at a valid UTF-8 character boundary
                 // Find the nearest valid char boundary at or before raw_scroll_pos
                 let mut scroll_pos = raw_scroll_pos;
@@ -1090,7 +1025,7 @@ impl MusicPlayerApp {
         // Bouncy bars + timer progress bar
         let progress_bar = if self.player.get_state() == PlayerState::Playing {
             // Bouncing bars animation
-            let frame = (self.animation_frame / 4) % 8;
+            let frame = (self.ui.animation_frame / 4) % 8;
             let bars = match frame {
                 0 => "▁▂▃▄▅▆▇█▁▂▃▄▅▆▇█▁▂▃▄▅▆▇█",
                 1 => "▂▃▄▅▆▇█▇▂▃▄▅▆▇█▇▂▃▄▅▆▇█▇",
@@ -1209,24 +1144,24 @@ impl MusicPlayerApp {
             },
             AppMode::Searching => {
                 match key.code {
-                    KeyCode::Char(c) if self.search_query.len() < MAX_SEARCH_QUERY_LEN => {
-                        self.search_query.push(c);
+                    KeyCode::Char(c) if self.search.query.len() < MAX_SEARCH_QUERY_LEN => {
+                        self.search.query.push(c);
                     }
                     KeyCode::Backspace => {
-                        self.search_query.pop();
+                        self.search.query.pop();
                     }
                     KeyCode::Enter => {
-                        let query = self.search_query.clone();
+                        let query = self.search.query.clone();
                         self.perform_search(&query).await;
                         self.mode = AppMode::Normal;
                         // Switch to Search view
                         self.previous_view = self.current_view;
                         self.current_view = ViewMode::Search;
-                        self.search_query.clear();
+                        self.search.query.clear();
                     }
                     KeyCode::Esc => {
                         self.mode = AppMode::Normal;
-                        self.search_query.clear();
+                        self.search.query.clear();
                         // Return to previous view
                         std::mem::swap(&mut self.current_view, &mut self.previous_view);
                     }
@@ -1234,25 +1169,25 @@ impl MusicPlayerApp {
                 }
             }
             AppMode::LoadingPlaylist => match key.code {
-                KeyCode::Char(c) if self.playlist_url.len() < MAX_PLAYLIST_URL_LEN => {
-                    self.playlist_url.push(c);
+                KeyCode::Char(c) if self.playlist.url.len() < MAX_PLAYLIST_URL_LEN => {
+                    self.playlist.url.push(c);
                 }
                 KeyCode::Backspace => {
-                    self.playlist_url.pop();
+                    self.playlist.url.pop();
                 }
                 KeyCode::Enter => {
-                    let url = self.playlist_url.clone();
+                    let url = self.playlist.url.clone();
                     if !url.is_empty() {
                         self.load_playlist_from_url(&url).await;
                     }
                     self.mode = AppMode::Normal;
-                    self.playlist_url.clear();
-                    self.playlist_loading_expanded = false;
+                    self.playlist.url.clear();
+                    self.ui.playlist_loading_expanded = false;
                 }
                 KeyCode::Esc => {
                     self.mode = AppMode::Normal;
-                    self.playlist_url.clear();
-                    self.playlist_loading_expanded = false;
+                    self.playlist.url.clear();
+                    self.ui.playlist_loading_expanded = false;
                     self.status_message = "Cancelled playlist loading".to_string();
                 }
                 _ => {}
@@ -1271,8 +1206,8 @@ impl MusicPlayerApp {
                     KeyCode::Char('l') => {
                         // Expand playlist loading view
                         self.mode = AppMode::LoadingPlaylist;
-                        self.playlist_loading_expanded = true;
-                        self.playlist_url.clear();
+                        self.ui.playlist_loading_expanded = true;
+                        self.playlist.url.clear();
                         self.status_message =
                             "Enter playlist URL (YouTube or YouTube Music)".to_string();
                     }
@@ -1280,8 +1215,8 @@ impl MusicPlayerApp {
                     KeyCode::Char('h') | KeyCode::Char('H') => {
                         if has_shift {
                             // Shift+H: Toggle history expansion
-                            self.history_expanded = !self.history_expanded;
-                            self.status_message = if self.history_expanded {
+                            self.ui.history_expanded = !self.ui.history_expanded;
+                            self.status_message = if self.ui.history_expanded {
                                 "History expanded - use j/k to navigate, Shift+C to clear"
                                     .to_string()
                             } else {
@@ -1297,14 +1232,14 @@ impl MusicPlayerApp {
                     KeyCode::Char('m') => {
                         if has_shift {
                             // Shift+m: Refresh My Mix (only when expanded)
-                            if self.my_mix_expanded {
+                            if self.ui.my_mix_expanded {
                                 self.status_message = "Refreshing My Mix...".to_string();
                                 self.refresh_my_mix().await;
                             }
                         } else {
                             // m: Toggle My Mix expansion
-                            self.my_mix_expanded = !self.my_mix_expanded;
-                            self.status_message = if self.my_mix_expanded {
+                            self.ui.my_mix_expanded = !self.ui.my_mix_expanded;
+                            self.status_message = if self.ui.my_mix_expanded {
                                 "My Mix expanded - use j/k to navigate, Shift+m to refresh"
                                     .to_string()
                             } else {
@@ -1314,7 +1249,7 @@ impl MusicPlayerApp {
                     }
                     KeyCode::Char('M') => {
                         // Capital M (Shift+m): Refresh My Mix
-                        if self.my_mix_expanded {
+                        if self.ui.my_mix_expanded {
                             self.status_message = "Refreshing My Mix...".to_string();
                             self.refresh_my_mix().await;
                         }
@@ -1333,8 +1268,8 @@ impl MusicPlayerApp {
                         self.play_previous().await;
                     }
                     KeyCode::Char('t') | KeyCode::Char('T') => {
-                        self.queue_expanded = !self.queue_expanded;
-                        self.status_message = if self.queue_expanded {
+                        self.ui.queue_expanded = !self.ui.queue_expanded;
+                        self.status_message = if self.ui.queue_expanded {
                             "Queue expanded - use j/k to navigate, d to delete".to_string()
                         } else {
                             "Queue collapsed".to_string()
@@ -1346,7 +1281,7 @@ impl MusicPlayerApp {
                     KeyCode::Char('c') | KeyCode::Char('C') => {
                         if has_shift {
                             // Shift+C: Clear history (only when expanded)
-                            if self.history_expanded {
+                            if self.ui.history_expanded {
                                 self.clear_history();
                             }
                         }
@@ -1356,11 +1291,11 @@ impl MusicPlayerApp {
                     KeyCode::Right => self.seek_forward(),
                     KeyCode::Left => self.seek_backward(),
                     KeyCode::Char('j') => {
-                        if self.queue_expanded {
+                        if self.ui.queue_expanded {
                             self.next_queue_item();
-                        } else if self.my_mix_expanded {
+                        } else if self.ui.my_mix_expanded {
                             self.next_mix_item();
-                        } else if self.history_expanded {
+                        } else if self.ui.history_expanded {
                             self.next_history_item();
                         } else if self.current_view == ViewMode::Home {
                             self.next_mix_item();
@@ -1369,11 +1304,11 @@ impl MusicPlayerApp {
                         }
                     }
                     KeyCode::Char('k') => {
-                        if self.queue_expanded {
+                        if self.ui.queue_expanded {
                             self.prev_queue_item();
-                        } else if self.my_mix_expanded {
+                        } else if self.ui.my_mix_expanded {
                             self.prev_mix_item();
-                        } else if self.history_expanded {
+                        } else if self.ui.history_expanded {
                             self.prev_history_item();
                         } else if self.current_view == ViewMode::Home {
                             self.prev_mix_item();
@@ -1396,7 +1331,7 @@ impl MusicPlayerApp {
 
     async fn perform_search(&mut self, query: &str) {
         // Mark as searching
-        self.is_searching = true;
+        self.search.is_searching = true;
 
         // Spawn background task for search
         let extractor = YouTubeExtractor::new();
@@ -1811,7 +1746,7 @@ impl MusicPlayerApp {
         // 3. If player Stopped but track exists -> RELOAD and play current track
         // 4. If something playing -> toggle pause/resume
 
-        if self.queue_expanded && !self.queue.is_empty() {
+        if self.ui.queue_expanded && !self.queue.is_empty() {
             // In expanded queue - play the SELECTED track!
             self.play_selected_queue_track().await;
         } else if self.queue.get_current().is_none() && !self.queue.is_empty() {
@@ -1836,16 +1771,16 @@ impl MusicPlayerApp {
         // Play the track at selected_queue_item index
         let queue_list = self.queue.get_queue_list();
 
-        if self.selected_queue_item >= queue_list.len() {
+        if self.ui.selected_queue_item >= queue_list.len() {
             self.status_message = "Invalid selection".to_string();
             return;
         }
 
-        let track = queue_list[self.selected_queue_item].clone();
+        let track = queue_list[self.ui.selected_queue_item].clone();
 
         // Remove all tracks before and including selected from queue
         // This makes the selected track the "current" one
-        for _ in 0..=self.selected_queue_item {
+        for _ in 0..=self.ui.selected_queue_item {
             self.queue.remove_at(0);
         }
 
@@ -1857,8 +1792,8 @@ impl MusicPlayerApp {
         self.play_track_from_cache_or_download(&track);
 
         // Collapse queue after selection
-        self.queue_expanded = false;
-        self.selected_queue_item = 0;
+        self.ui.queue_expanded = false;
+        self.ui.selected_queue_item = 0;
     }
 
     async fn play_current_or_first(&mut self) {
@@ -1913,17 +1848,17 @@ impl MusicPlayerApp {
     }
 
     fn next_search_result(&mut self) {
-        if !self.search_results.is_empty() {
-            self.selected_result = (self.selected_result + 1) % self.search_results.len();
+        if !self.search.results.is_empty() {
+            self.ui.selected_result = (self.ui.selected_result + 1) % self.search.results.len();
         }
     }
 
     fn prev_search_result(&mut self) {
-        if !self.search_results.is_empty() {
-            if self.selected_result == 0 {
-                self.selected_result = self.search_results.len() - 1;
+        if !self.search.results.is_empty() {
+            if self.ui.selected_result == 0 {
+                self.ui.selected_result = self.search.results.len() - 1;
             } else {
-                self.selected_result -= 1;
+                self.ui.selected_result -= 1;
             }
         }
     }
@@ -1931,22 +1866,22 @@ impl MusicPlayerApp {
     fn next_queue_item(&mut self) {
         let queue_len = self.queue.len();
         if queue_len > 0 {
-            self.selected_queue_item = (self.selected_queue_item + 1) % queue_len;
+            self.ui.selected_queue_item = (self.ui.selected_queue_item + 1) % queue_len;
             // HOVER DOWNLOAD: Start downloading this track immediately!
-            self.trigger_hover_download(self.selected_queue_item);
+            self.trigger_hover_download(self.ui.selected_queue_item);
         }
     }
 
     fn prev_queue_item(&mut self) {
         let queue_len = self.queue.len();
         if queue_len > 0 {
-            if self.selected_queue_item == 0 {
-                self.selected_queue_item = queue_len - 1;
+            if self.ui.selected_queue_item == 0 {
+                self.ui.selected_queue_item = queue_len - 1;
             } else {
-                self.selected_queue_item -= 1;
+                self.ui.selected_queue_item -= 1;
             }
             // HOVER DOWNLOAD: Start downloading this track immediately!
-            self.trigger_hover_download(self.selected_queue_item);
+            self.trigger_hover_download(self.ui.selected_queue_item);
         }
     }
 
@@ -1967,39 +1902,40 @@ impl MusicPlayerApp {
     }
 
     fn delete_selected_queue_item(&mut self) {
-        if self.queue_expanded && !self.queue.is_empty() {
-            if let Some(removed_track) = self.queue.remove_at(self.selected_queue_item) {
+        if self.ui.queue_expanded && !self.queue.is_empty() {
+            if let Some(removed_track) = self.queue.remove_at(self.ui.selected_queue_item) {
                 let clean_title = clean_title(&removed_track.title);
                 self.status_message = format!("Removed '{}' from queue", clean_title);
 
                 // Adjust selection if needed
                 let queue_len = self.queue.len();
                 if queue_len == 0 {
-                    self.selected_queue_item = 0;
-                } else if self.selected_queue_item >= queue_len {
-                    self.selected_queue_item = queue_len - 1;
+                    self.ui.selected_queue_item = 0;
+                } else if self.ui.selected_queue_item >= queue_len {
+                    self.ui.selected_queue_item = queue_len - 1;
                 }
 
                 // Don't save on every action - only on exit
                 // self.save_queue_async();
             }
-        } else if !self.queue_expanded {
+        } else if !self.ui.queue_expanded {
             self.status_message = "Press 't' to expand queue first".to_string();
         }
     }
 
     fn next_mix_item(&mut self) {
-        if !self.my_mix_playlists.is_empty() {
-            self.selected_mix_item = (self.selected_mix_item + 1) % self.my_mix_playlists.len();
+        if !self.playlist.my_mix_playlists.is_empty() {
+            self.ui.selected_mix_item =
+                (self.ui.selected_mix_item + 1) % self.playlist.my_mix_playlists.len();
         }
     }
 
     fn prev_mix_item(&mut self) {
-        if !self.my_mix_playlists.is_empty() {
-            if self.selected_mix_item == 0 {
-                self.selected_mix_item = self.my_mix_playlists.len() - 1;
+        if !self.playlist.my_mix_playlists.is_empty() {
+            if self.ui.selected_mix_item == 0 {
+                self.ui.selected_mix_item = self.playlist.my_mix_playlists.len() - 1;
             } else {
-                self.selected_mix_item -= 1;
+                self.ui.selected_mix_item -= 1;
             }
         }
     }
@@ -2007,17 +1943,17 @@ impl MusicPlayerApp {
     fn next_history_item(&mut self) {
         let history_len = self.queue.get_history().len();
         if history_len > 0 {
-            self.selected_history_item = (self.selected_history_item + 1) % history_len;
+            self.ui.selected_history_item = (self.ui.selected_history_item + 1) % history_len;
         }
     }
 
     fn prev_history_item(&mut self) {
         let history_len = self.queue.get_history().len();
         if history_len > 0 {
-            if self.selected_history_item == 0 {
-                self.selected_history_item = history_len - 1;
+            if self.ui.selected_history_item == 0 {
+                self.ui.selected_history_item = history_len - 1;
             } else {
-                self.selected_history_item -= 1;
+                self.ui.selected_history_item -= 1;
             }
         }
     }
@@ -2025,7 +1961,7 @@ impl MusicPlayerApp {
     fn clear_history(&mut self) {
         let count = self.queue.get_history().len();
         self.queue.clear_history();
-        self.selected_history_item = 0;
+        self.ui.selected_history_item = 0;
         self.status_message = format!("Cleared {} tracks from history", count);
 
         // Save to disk
@@ -2067,7 +2003,7 @@ impl MusicPlayerApp {
 
                 let track_count = tracks.len();
 
-                self.loaded_playlist_name = format!("Loaded Playlist ({} tracks)", track_count);
+                self.playlist.loaded_name = format!("Loaded Playlist ({} tracks)", track_count);
 
                 // Add tracks to queue (filter out tracks > 5 minutes)
                 let mut added_count = 0;
@@ -2082,7 +2018,7 @@ impl MusicPlayerApp {
                 }
 
                 // Store loaded playlist for display (moved after iteration to avoid clone)
-                self.loaded_playlist_tracks = tracks;
+                self.playlist.loaded_tracks = tracks;
 
                 // Trigger smart downloads - downloads next 15 + previous 5
                 self.trigger_smart_downloads();
@@ -2109,7 +2045,12 @@ impl MusicPlayerApp {
     }
 
     async fn add_selected_mix_to_queue(&mut self) {
-        if let Some(mix) = self.my_mix_playlists.get(self.selected_mix_item).cloned() {
+        if let Some(mix) = self
+            .playlist
+            .my_mix_playlists
+            .get(self.ui.selected_mix_item)
+            .cloned()
+        {
             self.status_message = format!(
                 "⏳ Fetching tracks from '{}'... (this may take a moment)",
                 mix.title
@@ -2267,9 +2208,11 @@ impl MusicPlayerApp {
                 if playlists.is_empty() {
                     self.status_message = "No My Mix playlists found".to_string();
                 } else {
-                    self.my_mix_playlists = playlists;
-                    self.status_message =
-                        format!("Loaded {} My Mix playlists", self.my_mix_playlists.len());
+                    self.playlist.my_mix_playlists = playlists;
+                    self.status_message = format!(
+                        "Loaded {} My Mix playlists",
+                        self.playlist.my_mix_playlists.len()
+                    );
                 }
             }
             Ok(Err(e)) => {
@@ -2376,7 +2319,7 @@ impl MusicPlayerApp {
     }
 
     fn add_selected_to_queue(&mut self) {
-        if let Some(video) = self.search_results.get(self.selected_result) {
+        if let Some(video) = self.search.results.get(self.ui.selected_result) {
             // Filter out tracks > 5 minutes (300 seconds) - this is a music player!
             if video.duration > MAX_TRACK_DURATION_SECS {
                 let clean_title = clean_title(&video.title);
@@ -2438,30 +2381,30 @@ impl MusicPlayerApp {
                 "Found {} account(s). Select one:",
                 self.available_accounts.len()
             );
-            self.selected_account_idx = 0;
+            self.ui.selected_account_idx = 0;
             self.mode = AppMode::AccountPicker;
         }
     }
 
     fn next_account(&mut self) {
         if !self.available_accounts.is_empty() {
-            self.selected_account_idx =
-                (self.selected_account_idx + 1) % self.available_accounts.len();
+            self.ui.selected_account_idx =
+                (self.ui.selected_account_idx + 1) % self.available_accounts.len();
         }
     }
 
     fn prev_account(&mut self) {
         if !self.available_accounts.is_empty() {
-            if self.selected_account_idx == 0 {
-                self.selected_account_idx = self.available_accounts.len() - 1;
+            if self.ui.selected_account_idx == 0 {
+                self.ui.selected_account_idx = self.available_accounts.len() - 1;
             } else {
-                self.selected_account_idx -= 1;
+                self.ui.selected_account_idx -= 1;
             }
         }
     }
 
     async fn select_account(&mut self) {
-        if let Some(account) = self.available_accounts.get(self.selected_account_idx) {
+        if let Some(account) = self.available_accounts.get(self.ui.selected_account_idx) {
             match self.browser_auth.save_selected_account(account) {
                 Ok(_) => {
                     self.status_message = format!(
@@ -2518,7 +2461,7 @@ impl MusicPlayerApp {
             .enumerate()
             .map(|(i, account)| {
                 let content = account.display_name.clone();
-                let style = if i == self.selected_account_idx {
+                let style = if i == self.ui.selected_account_idx {
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
