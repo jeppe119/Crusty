@@ -39,11 +39,13 @@ A terminal YouTube music player built in Rust as a learning project. It uses `yt
 
 - Search YouTube for songs and videos
 - Playlist support (YouTube & YouTube Music)
-- Smart caching (downloads to temp, auto-deletes after 1 hour)
-- Music-only filter (auto-filters tracks >5min)
+- Persistent download cache (tracks survive restarts, instant replay)
+- Resume playback on restart (saves position + volume)
+- Toggleable music-only filter (`f` key — filters tracks >5min, or allow all for podcasts)
+- Browser cookie auth (Chrome, Firefox, Zen — persists across sessions)
 - Background pre-downloading of next tracks
-- Seeking support (arrow keys skip 10 seconds)
-- Play/Pause/Skip/Volume controls
+- Native seeking (arrow keys skip 10 seconds, forward and backward)
+- Play/Pause/Skip/Volume controls (volume persisted)
 - Queue management with history
 - Progress bar and download indicator
 - Keyboard-driven interface
@@ -113,6 +115,7 @@ cargo run
 | `Shift+M` | Refresh My Mix playlists |
 | `Shift+H` | Toggle history view |
 | `Shift+C` | Clear history (when expanded) |
+| `f` | Toggle music-only filter (allow podcasts/long content) |
 | `d` | Delete selected item |
 | `Enter` | Add to queue / Play selected |
 | `?` | Show help |
@@ -205,17 +208,17 @@ async fn perform_search(&mut self, query: &str) {
 
 ## Recent Changes
 
-### Bug Fixes
-- Fixed rapid queue clearing bug (state check prevents false positives)
-- Fixed duplicate downloads from repeated input
-- Seeking now works with arrow keys
-- Download priority fixed (current + next tracks download first)
+### Latest
+- Persistent download cache — cached tracks play instantly on restart
+- Resume playback position and volume across sessions
+- Toggleable music-only filter — press `f` to allow podcasts/standups
+- Native seeking with rodio `try_seek` (forward and backward)
+- Zen Browser support (multi-profile)
 
-### New Features
-- Music-only filter (auto-filters tracks >5min)
-- Playlist loading indicator
-- Rolling download buffer
+### Previous
 - Smart download management (max 5 concurrent, lookahead pre-downloading)
+- Unified download state (eliminates TOCTOU race conditions)
+- Modular architecture (playback, navigation, actions extracted from app.rs)
 
 ---
 
