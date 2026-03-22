@@ -10,14 +10,11 @@ description = "A terminal-based music player that downloads playlist from YouTub
 tokio = { version = "1.35", features = ["full"] }
 
 # TUI framework
-ratatui = "0.25"
-crossterm = "0.27"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # Audio playback
-rodio = "0.17"
-
-# HTTP client for API requests
-reqwest = { version = "0.11", features = ["json", "blocking", "cookies"] }
+rodio = "0.22"
 
 # JSON serialization
 serde = { version = "1.0", features = ["derive"] }

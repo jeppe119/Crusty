@@ -1,26 +1,38 @@
 // Browser-based authentication
 // Detects YouTube accounts from Chrome/Firefox cookies
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserAccount {
-    pub browser: String,        // "chrome", "firefox", etc
-    pub profile: String,         // "Default", "Profile 1", etc
-    pub email: Option<String>,   // User's email if we can extract it
-    pub display_name: String,    // What to show in UI
+    pub browser: String,       // "chrome", "firefox", etc
+    pub profile: String,       // "Default", "Profile 1", etc
+    pub email: Option<String>, // User's email if we can extract it
+    pub display_name: String,  // What to show in UI
 }
+
+/// Allowed browser identifiers for cookie extraction.
+const ALLOWED_BROWSERS: &[&str] = &["chrome", "chromium", "firefox", "zen"];
 
 pub struct BrowserAuth {
     config_dir: PathBuf,
+}
+
+/// Returns true if a profile name is safe to embed in subprocess arguments.
+/// Only allows alphanumeric, dash, underscore, dot, and space characters.
+fn is_safe_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ' ')
 }
 
 impl BrowserAuth {
     pub fn new() -> Result<Self, String> {
         let config_dir = dirs::config_dir()
             .ok_or("Could not find config directory")?
-            .join("youtube-music-player");
+            .join(crate::config::APP_NAME);
 
         std::fs::create_dir_all(&config_dir)
             .map_err(|e| format!("Failed to create config directory: {}", e))?;
@@ -162,7 +174,10 @@ impl BrowserAuth {
                         if entry.path().is_dir() {
                             let profile_name = entry.file_name().to_string_lossy().to_string();
                             // Skip special directories
-                            if !profile_name.starts_with('.') && profile_name != "firefox-mpris" && profile_name != "Profile Groups" {
+                            if !profile_name.starts_with('.')
+                                && profile_name != "firefox-mpris"
+                                && profile_name != "Profile Groups"
+                            {
                                 // Check if this profile has cookies
                                 let cookies_path = entry.path().join("cookies.sqlite");
                                 if cookies_path.exists() {
@@ -234,7 +249,7 @@ impl BrowserAuth {
         Ok(())
     }
 
-    // Load previously selected account
+    // Load previously selected account with validation
     pub fn load_selected_account(&self) -> Option<BrowserAccount> {
         let config_path = self.config_dir.join("selected_account.json");
         if !config_path.exists() {
@@ -242,12 +257,32 @@ impl BrowserAuth {
         }
 
         let data = std::fs::read_to_string(&config_path).ok()?;
-        serde_json::from_str(&data).ok()
+        let account: BrowserAccount = serde_json::from_str(&data).ok()?;
+
+        // Validate browser field against allowlist
+        if !ALLOWED_BROWSERS.contains(&account.browser.as_str()) {
+            return None;
+        }
+
+        // Validate profile name contains only safe characters
+        if !is_safe_profile_name(&account.profile) {
+            return None;
+        }
+
+        Some(account)
     }
 
     // Get yt-dlp cookie arguments
     // Returns (use_cookies_from_browser: bool, arg: String)
     pub fn get_cookie_arg(&self, account: &BrowserAccount) -> (bool, String) {
+        // Validate browser and profile at the boundary to prevent injection
+        if !ALLOWED_BROWSERS.contains(&account.browser.as_str()) {
+            return (true, "chrome".to_string()); // safe fallback
+        }
+        if !is_safe_profile_name(&account.profile) {
+            return (true, "chrome".to_string()); // safe fallback
+        }
+
         match account.browser.as_str() {
             "chrome" => {
                 let arg = if account.profile == "Default" {
@@ -257,9 +292,7 @@ impl BrowserAuth {
                 };
                 (true, arg)
             }
-            "firefox" => {
-                (true, format!("firefox:{}", account.profile))
-            }
+            "firefox" => (true, format!("firefox:{}", account.profile)),
             "chromium" => {
                 let arg = if account.profile == "Default" {
                     "chromium".to_string()
@@ -286,7 +319,9 @@ impl BrowserAuth {
                     }
                 } else if cfg!(target_os = "macos") {
                     if let Some(home) = dirs::home_dir() {
-                        let profile_path = home.join("Library/Application Support/Zen").join(&account.profile);
+                        let profile_path = home
+                            .join("Library/Application Support/Zen")
+                            .join(&account.profile);
                         return (true, format!("firefox:{}", profile_path.display()));
                     }
                 } else if cfg!(target_os = "windows") {

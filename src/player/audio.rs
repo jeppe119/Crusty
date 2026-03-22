@@ -11,7 +11,7 @@
 // Key Concept: Rodio is a pure Rust audio playback library
 // It provides a "Sink" abstraction for controlling audio playback
 
-use rodio::{Decoder, OutputStream, Sink};
+use rodio::{Decoder, DeviceSinkBuilder, Player};
 use std::time::{Duration, Instant};
 
 // ==========================================
@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 // - Debug: Can print the state for debugging (e.g., println!("{:?}", state))
 // - Clone: Can make copies of the state
 // - PartialEq: Can compare states (e.g., if state == PlayerState::Playing)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlayerState {
     Stopped, // No audio loaded or playback has been stopped
     Playing, // Audio is currently playing
@@ -75,9 +75,9 @@ pub enum PlayerState {
 //   - Useful for displaying "Now Playing: ..."
 //   - Empty string when no track is loaded
 pub struct AudioPlayer {
-    // Note: We don't store OutputStream to avoid async drop issues
-    // The stream is leaked intentionally to keep audio working
-    sink: Option<Sink>,
+    // Note: We don't store MixerDeviceSink to avoid async drop issues
+    // The device sink is leaked intentionally to keep audio working
+    player: Option<Player>,
     state: PlayerState,
     volume: u32,
     duration: f64,
@@ -94,10 +94,10 @@ pub struct AudioPlayer {
 impl Drop for AudioPlayer {
     fn drop(&mut self) {
         // Stop playback before dropping
-        if let Some(sink) = &self.sink {
-            sink.stop();
+        if let Some(player) = &self.player {
+            player.stop();
         }
-        self.sink = None;
+        self.player = None;
     }
 }
 
@@ -132,20 +132,20 @@ impl AudioPlayer {
     // - Self is an alias for the type we're implementing (AudioPlayer)
     // - More flexible if you rename the struct later
     pub fn new() -> Self {
-        // Try to get the output stream and handle
+        // Try to get the default audio output device
         // This might fail if there's no audio device available
-        let sink = match OutputStream::try_default() {
-            Ok((stream, handle)) => {
-                // Successfully got audio device, create sink
-                match Sink::try_new(&handle) {
-                    Ok(sink) => {
-                        // Leak the stream to prevent it from being dropped in async context
-                        // This is intentional - we want the audio stream to live for the entire program
-                        std::mem::forget(stream);
-                        Some(sink)
-                    }
-                    Err(_) => None,
-                }
+        let player = match DeviceSinkBuilder::open_default_sink() {
+            Ok(device_sink) => {
+                // Successfully got audio device, create a Player and connect it
+                let (player, source) = Player::new();
+                device_sink.mixer().add(source);
+                // SAFETY: MixerDeviceSink must outlive the Player. We intentionally leak it because:
+                // (1) The Player's source is connected to this device sink's mixer
+                // (2) Rodio requires the device sink to remain alive for the duration of playback
+                // (3) There is exactly one AudioPlayer per process lifetime
+                // (4) Cleanup happens via process exit (AudioPlayer::drop stops the player first)
+                std::mem::forget(device_sink);
+                Some(player)
             }
             Err(_) => {
                 // No audio device available (e.g., headless server)
@@ -156,7 +156,7 @@ impl AudioPlayer {
 
         // Return the AudioPlayer with initial values
         AudioPlayer {
-            sink,
+            player,
             state: PlayerState::Stopped,
             volume: 100,
             duration: 0.0,
@@ -184,13 +184,13 @@ impl AudioPlayer {
     // In a real app, you'd want to do this asynchronously or in a background thread
     pub fn play_with_duration(&mut self, file_path: &str, title: &str, known_duration: f64) {
         // Only try to play if we have a sink (audio device available)
-        if let Some(sink) = &self.sink {
+        if let Some(player) = &self.player {
             // Set state to Loading BEFORE stopping to prevent race condition
             // This prevents auto-advance logic from thinking track finished
             self.state = PlayerState::Loading;
 
             // First, stop any currently playing audio
-            sink.stop();
+            player.stop();
 
             // Try to decode and play the audio file
             // Wrap the entire operation in a catch_unwind to prevent panics
@@ -199,20 +199,19 @@ impl AudioPlayer {
             }));
 
             match result {
-                Ok(Ok((decoder, _file_duration))) => {
+                Ok(Ok((decoder, file_duration))) => {
                     // Successfully got the audio!
 
                     // Try to append to sink - this can also panic
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        sink.append(decoder);
+                        player.append(decoder);
                     })) {
                         Ok(_) => {
-                            // Update our state
                             // Use known_duration if provided, otherwise use file duration
                             let duration = if known_duration > 0.0 {
                                 known_duration
                             } else {
-                                _file_duration
+                                file_duration
                             };
 
                             self.state = PlayerState::Playing;
@@ -226,18 +225,18 @@ impl AudioPlayer {
                         }
                         Err(_panic_err) => {
                             self.state = PlayerState::Stopped;
-                            self.start_time = None;  // Clear start time to prevent false is_finished()
+                            self.start_time = None; // Clear start time to prevent false is_finished()
                         }
                     }
                 }
                 Ok(Err(_e)) => {
                     // Failed to download/decode
                     self.state = PlayerState::Stopped;
-                    self.start_time = None;  // Clear start time to prevent false is_finished()
+                    self.start_time = None; // Clear start time to prevent false is_finished()
                 }
                 Err(_panic_err) => {
                     self.state = PlayerState::Stopped;
-                    self.start_time = None;  // Clear start time to prevent false is_finished()
+                    self.start_time = None; // Clear start time to prevent false is_finished()
                 }
             }
         }
@@ -245,14 +244,20 @@ impl AudioPlayer {
 
     // Helper function to decode audio from file
     // Returns the decoder and duration
-    fn decode_from_file(file_path: &str) -> Result<(Decoder<std::fs::File>, f64), Box<dyn std::error::Error>> {
+    fn decode_from_file(
+        file_path: &str,
+    ) -> Result<(Decoder<std::fs::File>, f64), Box<dyn std::error::Error>> {
         // Open the file
         let file = std::fs::File::open(file_path)
             .map_err(|e| format!("Failed to open audio file: {}", e))?;
 
         // Decode the audio format (MP3, M4A, WAV, etc.)
-        let decoder = Decoder::new(file)
-            .map_err(|e| format!("Audio decode failed: {}. File may be corrupted or invalid format.", e))?;
+        let decoder = Decoder::new(file).map_err(|e| {
+            format!(
+                "Audio decode failed: {}. File may be corrupted or invalid format.",
+                e
+            )
+        })?;
 
         // Try to calculate duration (TODO: implement)
         let duration = 0.0;
@@ -279,8 +284,8 @@ impl AudioPlayer {
     // Note: Calling pause() when already paused is safe (no-op)
     pub fn pause(&mut self) {
         // Tell the sink to pause audio output
-        if let Some(sink) = &self.sink {
-            sink.pause();
+        if let Some(player) = &self.player {
+            player.pause();
         }
 
         // Track when we paused for accurate position tracking
@@ -310,8 +315,8 @@ impl AudioPlayer {
     // Note: Calling resume() when already playing is safe (no-op)
     pub fn resume(&mut self) {
         // Tell the sink to resume audio output
-        if let Some(sink) = &self.sink {
-            sink.play();
+        if let Some(player) = &self.player {
+            player.play();
         }
 
         // Update total paused duration
@@ -376,8 +381,8 @@ impl AudioPlayer {
     // - stop(): Audio is cleared, must reload to play again
     pub fn stop(&mut self) {
         // Tell the sink to stop and clear audio
-        if let Some(sink) = &self.sink {
-            sink.stop();
+        if let Some(player) = &self.player {
+            player.stop();
         }
 
         // Reset timing information
@@ -420,7 +425,9 @@ impl AudioPlayer {
 
     // Actually perform the seek by reloading
     pub fn apply_seek(&mut self) -> bool {
-        if let (Some(seek_pos), Some(file_path)) = (self.seek_position, self.current_file_path.clone()) {
+        if let (Some(seek_pos), Some(file_path)) =
+            (self.seek_position, self.current_file_path.clone())
+        {
             // Reload the track
             let title = self.current_title.clone();
             let duration = self.duration;
@@ -473,6 +480,7 @@ impl AudioPlayer {
     // - We store 75 as u32
     // - We convert to 0.75 for sink
     // - get_volume() returns 75 (not 74.999... from float conversion)
+    #[must_use]
     pub fn get_volume(&self) -> u32 {
         // Simply return our stored volume value
         self.volume
@@ -512,8 +520,8 @@ impl AudioPlayer {
         let rodio_volume = volume as f32 / 100.0;
 
         // 3. Tell the sink to apply the new volume
-        if let Some(sink) = &self.sink {
-            sink.set_volume(rodio_volume);
+        if let Some(player) = &self.player {
+            player.set_volume(rodio_volume);
         }
     }
 
@@ -539,6 +547,7 @@ impl AudioPlayer {
     // - Or use a different audio library with position tracking
     //
     // TODO: Implement time tracking system
+    #[must_use]
     pub fn get_time_pos(&self) -> f64 {
         // Calculate elapsed time based on start_time and paused duration
         if let Some(start) = self.start_time {
@@ -579,9 +588,8 @@ impl AudioPlayer {
     // - Progress bars (current_pos / duration = percentage)
     // - Displaying track length (3:45, 2:30, etc.)
     // - Seeking validation (can't seek past duration)
+    #[must_use]
     pub fn get_duration(&self) -> f64 {
-        // Simply return the stored duration
-        // Will be 0.0 until play() is implemented
         self.duration
     }
 
@@ -607,9 +615,9 @@ impl AudioPlayer {
     // - UI to show play/pause button
     // - Logic to decide if toggle should pause or resume
     // - Debugging to check player state
+    #[must_use]
     pub fn get_state(&self) -> PlayerState {
-        // Clone and return the current state
-        self.state.clone()
+        self.state
     }
 
     // ==========================================
@@ -625,10 +633,11 @@ impl AudioPlayer {
     //
     // IMPORTANT: We use state + time checks to prevent rapid auto-advance bugs
     // where the sink might be briefly empty during track loading/buffering.
+    #[must_use]
     pub fn is_finished(&self) -> bool {
-        if let Some(sink) = &self.sink {
+        if let Some(player) = &self.player {
             // First check: sink must be empty
-            if !sink.empty() {
+            if !player.empty() {
                 return false;
             }
 
@@ -648,15 +657,11 @@ impl AudioPlayer {
                 // 2-SECOND GUARD: Feels natural and prevents edge cases
                 // Combined with state check above, this prevents rapid queue clearing
                 // while still allowing tracks to finish properly
-                if playback_time >= 2.0 {
-                    return true;
-                }
-
-                return false;
+                playback_time >= 2.0
             } else {
                 // No start time - track never actually started playing
                 // Return false to prevent skipping tracks that failed to load
-                return false;
+                false
             }
         } else {
             false

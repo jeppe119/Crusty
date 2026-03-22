@@ -1,46 +1,53 @@
 // Main TUI application using ratatui
 // Handles the terminal interface, user input, and display
 
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
-    Frame, Terminal,
-    style::{Color, Modifier, Style},
-};
+use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use std::io;
-use tokio::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+    Frame, Terminal,
+};
 use std::collections::HashMap;
+use std::io;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
+use crate::config::{
+    self, clean_title, format_time, is_allowed_youtube_url, MAX_CONCURRENT_DOWNLOADS,
+    MAX_PLAYLIST_URL_LEN, MAX_SEARCH_QUERY_LEN, MAX_TRACK_DURATION_SECS,
+};
 use crate::player::audio::{AudioPlayer, PlayerState};
 use crate::player::queue::{Queue, Track};
-use crate::youtube::extractor::{YouTubeExtractor, VideoInfo};
-use crate::youtube::browser_auth::{BrowserAuth, BrowserAccount};
+use crate::youtube::browser_auth::{BrowserAccount, BrowserAuth};
+use crate::youtube::extractor::{self, VideoInfo, YouTubeExtractor};
 
+#[derive(Debug, PartialEq)]
 enum AppMode {
     Normal,
     Searching,
-    LoginPrompt,   // Show login screen
-    AccountPicker, // Show list of browser accounts
-    Help,          // Show help screen with keybinds
+    LoginPrompt,     // Show login screen
+    AccountPicker,   // Show list of browser accounts
+    Help,            // Show help screen with keybinds
     LoadingPlaylist, // Loading playlist from URL
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum ViewMode {
-    Home,      // Showing My Mix | History
-    Search,    // Showing Search Results | History
+    Home,   // Showing My Mix | History
+    Search, // Showing Search Results | History
 }
 
 #[derive(Debug, Clone)]
 struct MixPlaylist {
-    _id: String,
     title: String,
     track_count: usize,
     url: String,
@@ -55,7 +62,6 @@ struct QueueState {
 pub struct MusicPlayerApp {
     player: AudioPlayer,
     queue: Queue,
-    _extractor: YouTubeExtractor,
     browser_auth: BrowserAuth,
     available_accounts: Vec<BrowserAccount>,
     selected_account_idx: usize,
@@ -115,19 +121,23 @@ pub struct MusicPlayerApp {
 }
 
 impl MusicPlayerApp {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         let (search_tx, search_rx) = mpsc::unbounded_channel();
         let (download_tx, download_rx) = mpsc::unbounded_channel();
 
-        // Initialize browser auth
-        let browser_auth = BrowserAuth::new().expect("Failed to initialize browser auth");
+        // Initialize browser auth (fallible — may fail if $HOME is unset or config dir is inaccessible)
+        let browser_auth = BrowserAuth::new()
+            .map_err(|e| anyhow::anyhow!("Failed to initialize browser auth: {}", e))?;
 
         // Check if user has already selected an account
         let is_authenticated = browser_auth.is_authenticated();
 
         let status_message = if is_authenticated {
             if let Some(account) = browser_auth.load_selected_account() {
-                format!("Welcome back! Logged in as {} - Press '/' to search", account.display_name)
+                format!(
+                    "Welcome back! Logged in as {} - Press '/' to search",
+                    account.display_name
+                )
             } else {
                 String::new()
             }
@@ -155,10 +165,9 @@ impl MusicPlayerApp {
         //     queue.restore_queue(queue_state.tracks, queue_state.current_track);
         // }
 
-        MusicPlayerApp {
+        Ok(MusicPlayerApp {
             player: AudioPlayer::new(),
             queue,
-            _extractor: YouTubeExtractor::new(),
             browser_auth,
             available_accounts: Vec::new(),
             selected_account_idx: 0,
@@ -197,7 +206,7 @@ impl MusicPlayerApp {
             title_scroll_offset: 0,
             background_tasks: Arc::new(Mutex::new(Vec::new())),
             last_animation_update: std::time::Instant::now(),
-        }
+        })
     }
 
     // Get animated download indicator (Pac-Man style)
@@ -205,20 +214,18 @@ impl MusicPlayerApp {
         // Animate every 8 frames (slower animation)
         let frame = (self.animation_frame / 8) % 4;
         match frame {
-            0 => "ᗧ··· ",  // Pac-Man open
-            1 => "·ᗧ·· ",  // Moving right
-            2 => "··ᗧ· ",  // Moving right
-            3 => "···ᗧ ",  // Moving right
+            0 => "ᗧ··· ", // Pac-Man open
+            1 => "·ᗧ·· ", // Moving right
+            2 => "··ᗧ· ", // Moving right
+            3 => "···ᗧ ", // Moving right
             _ => "ᗧ··· ",
         }
     }
 
-    fn load_history() -> Result<Vec<Track>, Box<dyn std::error::Error>> {
+    fn load_history() -> Result<Vec<Track>> {
         use std::fs;
 
-        let config_dir = dirs::config_dir()
-            .ok_or("Could not find config directory")?
-            .join("youtube-music-player");
+        let config_dir = config::config_dir()?;
 
         let history_file = config_dir.join("history.json");
 
@@ -226,41 +233,48 @@ impl MusicPlayerApp {
             return Ok(Vec::new());
         }
 
-        let contents = fs::read_to_string(history_file)?;
-        let history: Vec<Track> = serde_json::from_str(&contents)?;
+        // Guard against oversized files on disk
+        let metadata = fs::metadata(&history_file).context("Failed to stat history file")?;
+        if metadata.len() > 10 * 1024 * 1024 {
+            anyhow::bail!("History file too large ({} bytes)", metadata.len());
+        }
+
+        let contents = fs::read_to_string(&history_file).context("Failed to read history file")?;
+        let history: Vec<Track> =
+            serde_json::from_str(&contents).context("Failed to parse history file")?;
+
+        if history.len() > 10_000 {
+            anyhow::bail!("History file contains too many entries ({})", history.len());
+        }
 
         Ok(history)
     }
 
-    fn save_history(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn save_history(&mut self) -> Result<()> {
         use std::fs;
 
         // Limit history to 100 most recent tracks before saving
         self.queue.limit_history(100);
 
-        let config_dir = dirs::config_dir()
-            .ok_or("Could not find config directory")?
-            .join("youtube-music-player");
+        let config_dir = config::config_dir()?;
 
-        fs::create_dir_all(&config_dir)?;
+        fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
 
         let history_file = config_dir.join("history.json");
         let history = self.queue.get_history();
-        let json = serde_json::to_string_pretty(history)?;
+        let json = serde_json::to_string_pretty(history).context("Failed to serialize history")?;
 
-        fs::write(history_file, json)?;
+        fs::write(history_file, json).context("Failed to write history file")?;
 
         Ok(())
     }
 
-    fn save_queue(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn save_queue(&self) -> Result<()> {
         use std::fs;
 
-        let config_dir = dirs::config_dir()
-            .ok_or("Could not find config directory")?
-            .join("youtube-music-player");
+        let config_dir = config::config_dir()?;
 
-        fs::create_dir_all(&config_dir)?;
+        fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
 
         let queue_file = config_dir.join("queue.json");
 
@@ -270,9 +284,10 @@ impl MusicPlayerApp {
             current_track: self.queue.get_current().cloned(),
         };
 
-        let json = serde_json::to_string_pretty(&queue_state)?;
+        let json =
+            serde_json::to_string_pretty(&queue_state).context("Failed to serialize queue")?;
 
-        fs::write(queue_file, json)?;
+        fs::write(queue_file, json).context("Failed to write queue file")?;
 
         Ok(())
     }
@@ -286,9 +301,7 @@ impl MusicPlayerApp {
         let result = tokio::task::spawn_blocking(|| -> Result<QueueState, String> {
             use std::fs;
 
-            let config_dir = dirs::config_dir()
-                .ok_or("Could not find config directory")?
-                .join("youtube-music-player");
+            let config_dir = crate::config::config_dir().map_err(|e| e.to_string())?;
 
             let queue_file = config_dir.join("queue.json");
 
@@ -299,18 +312,42 @@ impl MusicPlayerApp {
                 });
             }
 
-            let contents = fs::read_to_string(queue_file)
+            // Guard against oversized files on disk
+            let metadata = fs::metadata(&queue_file)
+                .map_err(|e| format!("Failed to stat queue file: {}", e))?;
+            if metadata.len() > 10 * 1024 * 1024 {
+                return Err(format!("Queue file too large ({} bytes)", metadata.len()));
+            }
+
+            let contents = fs::read_to_string(&queue_file)
                 .map_err(|e| format!("Failed to read queue file: {}", e))?;
             let queue_state: QueueState = serde_json::from_str(&contents)
                 .map_err(|e| format!("Failed to parse queue file: {}", e))?;
 
+            if queue_state.tracks.len() > 10_000 {
+                return Err(format!(
+                    "Queue file contains too many entries ({})",
+                    queue_state.tracks.len()
+                ));
+            }
+
             Ok(queue_state)
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok(queue_state)) => {
-                let track_count = queue_state.tracks.len();
-                self.queue.restore_queue(queue_state.tracks, queue_state.current_track);
+                // Validate URLs loaded from disk before restoring
+                let valid_tracks: Vec<Track> = queue_state
+                    .tracks
+                    .into_iter()
+                    .filter(|t| is_allowed_youtube_url(&t.url))
+                    .collect();
+                let valid_current = queue_state
+                    .current_track
+                    .filter(|t| is_allowed_youtube_url(&t.url));
+                let track_count = valid_tracks.len();
+                self.queue.restore_queue(valid_tracks, valid_current);
                 self.queue_loaded = true;
 
                 // LIGHTWEIGHT RESTORATION STRATEGY:
@@ -353,9 +390,13 @@ impl MusicPlayerApp {
                     } else {
                         "downloading"
                     };
-                    self.status_message = format!("Restored {} tracks - {} ({} downloading)", track_count, priority_info, downloads_started);
+                    self.status_message = format!(
+                        "Restored {} tracks - {} ({} downloading)",
+                        track_count, priority_info, downloads_started
+                    );
                 } else {
-                    self.status_message = format!("Restored {} tracks from previous session", track_count);
+                    self.status_message =
+                        format!("Restored {} tracks from previous session", track_count);
                 }
             }
             Ok(Err(e)) => {
@@ -369,7 +410,7 @@ impl MusicPlayerApp {
         }
     }
 
-    pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(&mut self) -> Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -432,8 +473,12 @@ impl MusicPlayerApp {
                             if track.video_id == video_id {
                                 // Use async sleep instead of blocking thread sleep
                                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                self.player.play_with_duration(&temp_file_path, &track.title, track.duration as f64);
-                                self.status_message = "".to_string();  // Clear status - player shows track
+                                self.player.play_with_duration(
+                                    &temp_file_path,
+                                    &track.title,
+                                    track.duration as f64,
+                                );
+                                self.status_message.clear(); // Clear status - player shows track
                                 self.pending_play_track = None;
                                 self.currently_downloading = None;
 
@@ -451,10 +496,13 @@ impl MusicPlayerApp {
 
                         // RETRY PENDING: Check if there's a pending track waiting (was rate-limited)
                         if let Some(pending_track) = &self.pending_play_track {
-                            let cached = self.downloaded_files.lock().ok()
-                                .and_then(|files| files.contains_key(&pending_track.video_id).then(|| ()));
+                            let cached = self
+                                .downloaded_files
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .contains_key(&pending_track.video_id);
 
-                            if cached.is_none() && self.currently_downloading.is_none() {
+                            if !cached && self.currently_downloading.is_none() {
                                 // Pending track not in cache and not downloading - retry now!
                                 if self.spawn_download_with_limit(pending_track) {
                                     self.currently_downloading = Some(pending_track.title.clone());
@@ -474,10 +522,13 @@ impl MusicPlayerApp {
 
                         // RETRY PENDING: Even on failure, check if there's a pending track waiting
                         if let Some(pending_track) = &self.pending_play_track {
-                            let cached = self.downloaded_files.lock().ok()
-                                .and_then(|files| files.contains_key(&pending_track.video_id).then(|| ()));
+                            let cached = self
+                                .downloaded_files
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .contains_key(&pending_track.video_id);
 
-                            if cached.is_none() && self.currently_downloading.is_none() {
+                            if !cached && self.currently_downloading.is_none() {
                                 // Pending track not in cache and not downloading - retry now!
                                 if self.spawn_download_with_limit(pending_track) {
                                     self.currently_downloading = Some(pending_track.title.clone());
@@ -518,9 +569,12 @@ impl MusicPlayerApp {
             }
         }
 
-        // CRITICAL: Abort all background download tasks before saving!
-        eprintln!("Cleaning up background downloads...");
-        if let Ok(mut tasks) = self.background_tasks.lock() {
+        // Abort all background download tasks before saving
+        {
+            let mut tasks = self
+                .background_tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for handle in tasks.drain(..) {
                 handle.abort();
             }
@@ -570,11 +624,11 @@ impl MusicPlayerApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),      // Header
-                Constraint::Min(10),        // Main area
-                Constraint::Length(6),      // Bottom bar (compact - Playlists | Unified Player)
+                Constraint::Length(3), // Header
+                Constraint::Min(10),   // Main area
+                Constraint::Length(6), // Bottom bar (compact - Playlists | Unified Player)
             ])
-            .split(frame.size());
+            .split(frame.area());
 
         // Header
         let title = if self.is_searching {
@@ -584,22 +638,29 @@ impl MusicPlayerApp {
         } else {
             match self.mode {
                 AppMode::Searching => format!("🔍 SEARCH MODE: {}_", self.search_query),
-                AppMode::LoadingPlaylist => format!("📋 PASTE PLAYLIST URL: {}_  (Press Enter to load, Esc to cancel)", self.playlist_url),
+                AppMode::LoadingPlaylist => format!(
+                    "📋 PASTE PLAYLIST URL: {}_  (Press Enter to load, Esc to cancel)",
+                    self.playlist_url
+                ),
                 AppMode::Normal => {
-                    let account_info = if let Some(account) = self.browser_auth.load_selected_account() {
-                        format!(" | Account: {}", account.display_name)
-                    } else {
-                        String::new()
-                    };
+                    let account_info =
+                        if let Some(account) = self.browser_auth.load_selected_account() {
+                            format!(" | Account: {}", account.display_name)
+                        } else {
+                            String::new()
+                        };
                     format!("Controls: [/]Search [l]LoadPlaylist [Enter]Add [n]Next [p]Prev [Space]Play/Pause [j/k]Navigate [Shift+↑/↓]Volume [?]Help [q]Quit{}", account_info)
-                },
+                }
                 AppMode::LoginPrompt => "Login Required".to_string(),
                 AppMode::AccountPicker => "Select YouTube Account".to_string(),
                 AppMode::Help => "Help - Press '?', 'Esc', or 'q' to close".to_string(),
             }
         };
-        let header = Paragraph::new(title)
-            .block(Block::default().borders(Borders::ALL).title("YouTube Music Player"));
+        let header = Paragraph::new(title).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("YouTube Music Player"),
+        );
         frame.render_widget(header, chunks[0]);
 
         // Main area layout depends on queue expansion, my mix expansion, history expansion, or view mode
@@ -639,9 +700,9 @@ impl MusicPlayerApp {
         let bottom_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(50),  // Player
-                Constraint::Percentage(15),  // Cache/Downloads
-                Constraint::Percentage(35),  // Playlists (more space!)
+                Constraint::Percentage(50), // Player
+                Constraint::Percentage(15), // Cache/Downloads
+                Constraint::Percentage(35), // Playlists (more space!)
             ])
             .split(chunks[2]);
 
@@ -658,7 +719,9 @@ impl MusicPlayerApp {
             .map(|(i, video)| {
                 let content = video.title.clone();
                 let style = if i == self.selected_result {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -666,8 +729,11 @@ impl MusicPlayerApp {
             })
             .collect();
 
-        let results_list = List::new(results)
-            .block(Block::default().borders(Borders::ALL).title("Search Results"));
+        let results_list = List::new(results).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Search Results"),
+        );
         frame.render_widget(results_list, area);
     }
 
@@ -676,8 +742,13 @@ impl MusicPlayerApp {
         let queue_len = self.queue.len();
 
         if queue_len == 0 {
-            let queue_widget = Paragraph::new("Queue is empty - Add tracks by pressing Enter on search results")
-                .block(Block::default().borders(Borders::ALL).title("Queue (0 tracks) - Press 't' to expand for management"));
+            let queue_widget =
+                Paragraph::new("Queue is empty - Add tracks by pressing Enter on search results")
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Queue (0 tracks) - Press 't' to expand for management"),
+                    );
             frame.render_widget(queue_widget, area);
         } else {
             // Calculate how many items fit in the visible area (fill the whole box!)
@@ -695,8 +766,11 @@ impl MusicPlayerApp {
                 })
                 .collect();
 
-            let queue_list_widget = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(format!("Queue ({} tracks) - Press 't' to expand for management", queue_len)));
+            let queue_list_widget =
+                List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
+                    "Queue ({} tracks) - Press 't' to expand for management",
+                    queue_len
+                )));
             frame.render_widget(queue_list_widget, area);
         }
     }
@@ -735,7 +809,9 @@ impl MusicPlayerApp {
                 let actual_idx = start_idx + i;
                 let content = format!("{}. {}", actual_idx + 1, &track.title);
                 let style = if actual_idx == self.selected_queue_item {
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -744,13 +820,21 @@ impl MusicPlayerApp {
             .collect();
 
         let scroll_indicator = if total_tracks > visible_height {
-            format!(" (Showing {}-{} of {})", start_idx + 1, end_idx, total_tracks)
+            format!(
+                " (Showing {}-{} of {})",
+                start_idx + 1,
+                end_idx,
+                total_tracks
+            )
         } else {
             String::new()
         };
 
-        let queue_list = List::new(queue_items)
-            .block(Block::default().borders(Borders::ALL).title(format!("Queue (Expanded) - {} tracks{} | [j/k] Navigate | [d] Delete | [t] Collapse", total_tracks, scroll_indicator)));
+        let queue_list =
+            List::new(queue_items).block(Block::default().borders(Borders::ALL).title(format!(
+                "Queue (Expanded) - {} tracks{} | [j/k] Navigate | [d] Delete | [t] Collapse",
+                total_tracks, scroll_indicator
+            )));
         frame.render_widget(queue_list, area);
     }
 
@@ -764,16 +848,19 @@ impl MusicPlayerApp {
 
         let history_items: Vec<ListItem> = queue_history
             .iter()
-            .rev()  // Show most recent first
-            .take(max_items)  // Fill the box!
+            .rev() // Show most recent first
+            .take(max_items) // Fill the box!
             .map(|track| {
                 let content = track.title.clone();
                 ListItem::new(content).style(Style::default().fg(Color::DarkGray))
             })
             .collect();
 
-        let history_list = List::new(history_items)
-            .block(Block::default().borders(Borders::ALL).title(format!("History ({} played) - Press [Shift+H] to expand", total_history)));
+        let history_list =
+            List::new(history_items).block(Block::default().borders(Borders::ALL).title(format!(
+                "History ({} played) - Press [Shift+H] to expand",
+                total_history
+            )));
         frame.render_widget(history_list, area);
     }
 
@@ -807,7 +894,9 @@ impl MusicPlayerApp {
             .map(|(i, track)| {
                 let content = format!("{}. {}", i + 1, &track.title);
                 let style = if i == self.selected_history_item {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -816,7 +905,12 @@ impl MusicPlayerApp {
             .collect();
 
         let scroll_indicator = if total_history > visible_height {
-            format!(" (Showing {}-{} of {})", start_idx + 1, end_idx, total_history)
+            format!(
+                " (Showing {}-{} of {})",
+                start_idx + 1,
+                end_idx,
+                total_history
+            )
         } else {
             String::new()
         };
@@ -834,14 +928,15 @@ impl MusicPlayerApp {
                 .take(50)
                 .enumerate()
                 .map(|(i, track)| {
-                    let duration = Self::format_time(track.duration as f64);
+                    let duration = format_time(track.duration as f64);
                     let content = format!("{}. {} [{}]", i + 1, &track.title, duration);
                     ListItem::new(content).style(Style::default().fg(Color::White))
                 })
                 .collect()
         } else if self.my_mix_playlists.is_empty() {
             vec![
-                ListItem::new("Press 'l' to load a playlist URL").style(Style::default().fg(Color::Yellow)),
+                ListItem::new("Press 'l' to load a playlist URL")
+                    .style(Style::default().fg(Color::Yellow)),
                 ListItem::new(""),
                 ListItem::new("YouTube Music playlists supported!"),
             ]
@@ -856,7 +951,9 @@ impl MusicPlayerApp {
                         mix.title.clone()
                     };
                     let style = if i == self.selected_mix_item {
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
                     };
@@ -871,19 +968,22 @@ impl MusicPlayerApp {
             "Playlists - Press [l] to load playlist URL".to_string()
         };
 
-        let mix_list = List::new(mix_items)
-            .block(Block::default().borders(Borders::ALL).title(title));
+        let mix_list =
+            List::new(mix_items).block(Block::default().borders(Borders::ALL).title(title));
         frame.render_widget(mix_list, area);
     }
 
     fn draw_my_mix_expanded(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let mix_items: Vec<ListItem> = self.my_mix_playlists
+        let mix_items: Vec<ListItem> = self
+            .my_mix_playlists
             .iter()
             .enumerate()
             .map(|(i, mix)| {
                 let content = format!("{}. {} ({} tracks)", i + 1, mix.title, mix.track_count);
                 let style = if i == self.selected_mix_item {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -916,10 +1016,15 @@ impl MusicPlayerApp {
             "Example URLs:",
             "  https://music.youtube.com/playlist?list=...",
             "  https://www.youtube.com/playlist?list=...",
-        ].join("\n");
+        ]
+        .join("\n");
 
         let loading_widget = Paragraph::new(loading_text)
-            .block(Block::default().borders(Borders::ALL).title("Load Playlist (Expanded) - Press [Esc] to cancel"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Load Playlist (Expanded) - Press [Esc] to cancel"),
+            )
             .style(Style::default().fg(Color::Cyan))
             .alignment(Alignment::Left);
 
@@ -932,7 +1037,7 @@ impl MusicPlayerApp {
 
         // Line 1: Now Playing title (rotating if too long)
         let now_playing = if let Some(track) = current_track {
-            let clean_title = Self::clean_title(&track.title);
+            let clean_title = clean_title(&track.title);
             let full_text = format!("{} - {}", clean_title, track.uploader);
 
             // Scroll text if too long (more than 80 chars)
@@ -944,7 +1049,11 @@ impl MusicPlayerApp {
                 while scroll_pos > 0 && !full_text.is_char_boundary(scroll_pos) {
                     scroll_pos -= 1;
                 }
-                let rotated = format!("{}   {}", &full_text[scroll_pos..], &full_text[..scroll_pos]);
+                let rotated = format!(
+                    "{}   {}",
+                    &full_text[scroll_pos..],
+                    &full_text[..scroll_pos]
+                );
 
                 // Also ensure the final slice is at a char boundary
                 let max_len = 80.min(rotated.len());
@@ -978,42 +1087,7 @@ impl MusicPlayerApp {
             0.0
         };
 
-        let _progress_ratio = if duration > 0.0 {
-            (time_pos / duration * 100.0).min(100.0) as u16
-        } else {
-            0
-        };
-
-        // Build progress bar string with bouncing bars
-        let _progress_visual = if self.player.get_state() == PlayerState::Playing {
-            // Always show bouncing bars when playing
-            let frame = (self.animation_frame / 4) % 8;
-            let bars = match frame {
-                0 => "▁▂▃▄▅▆▇█",
-                1 => "▂▃▄▅▆▇█▇",
-                2 => "▃▄▅▆▇█▇▆",
-                3 => "▄▅▆▇█▇▆▅",
-                4 => "▅▆▇█▇▆▅▄",
-                5 => "▆▇█▇▆▅▄▃",
-                6 => "▇█▇▆▅▄▃▂",
-                7 => "█▇▆▅▄▃▂▁",
-                _ => "▄▄▄▄▄▄▄▄",
-            };
-
-            if duration > 0.0 {
-                // Show elapsed/total when duration is known
-                format!("{} {}/{}", bars, Self::format_time(time_pos), Self::format_time(duration))
-            } else {
-                // Just show elapsed time when duration isn't available yet
-                format!("{} {}", bars, Self::format_time(time_pos))
-            }
-        } else if duration > 0.0 {
-            format!("{}/{}", Self::format_time(time_pos), Self::format_time(duration))
-        } else {
-            "Not playing".to_string()
-        };
-
-        // Just bouncy bars + timer, no progress bar
+        // Bouncy bars + timer progress bar
         let progress_bar = if self.player.get_state() == PlayerState::Playing {
             // Bouncing bars animation
             let frame = (self.animation_frame / 4) % 8;
@@ -1031,14 +1105,19 @@ impl MusicPlayerApp {
 
             // Just bars + timer
             if duration > 0.0 {
-                format!("{} {}/{}", bars, Self::format_time(time_pos), Self::format_time(duration))
+                format!(
+                    "{} {}/{}",
+                    bars,
+                    format_time(time_pos),
+                    format_time(duration)
+                )
             } else {
-                format!("{} {}", bars, Self::format_time(time_pos))
+                format!("{} {}", bars, format_time(time_pos))
             }
         } else {
             // When paused, just show time
             if duration > 0.0 {
-                format!("{}/{}", Self::format_time(time_pos), Self::format_time(duration))
+                format!("{}/{}", format_time(time_pos), format_time(duration))
             } else {
                 "Not playing".to_string()
             }
@@ -1053,7 +1132,12 @@ impl MusicPlayerApp {
         };
 
         let volume = self.player.get_volume();
-        let status_line = format!("{} | Vol: {}% | Queue: {} tracks", state_str, volume, self.queue.size());
+        let status_line = format!(
+            "{} | Vol: {}% | Queue: {} tracks",
+            state_str,
+            volume,
+            self.queue.len()
+        );
 
         // Combine all 3 lines inside single Player box
         let player_content = format!("{}\n{}\n{}", now_playing, progress_bar, status_line);
@@ -1067,14 +1151,23 @@ impl MusicPlayerApp {
 
     fn draw_cache_stats(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         // Cache/Download stats box
-        let active_count = self.active_downloads.lock().ok().map(|c| *c).unwrap_or(0);
-        let cached_count = self.downloaded_files.lock().ok().map(|f| f.len()).unwrap_or(0);
+        let active_count = *self
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cached_count = self
+            .downloaded_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
 
         let cache_info = if active_count > 0 {
-            format!("{}\n⬇ {}\n💾 {}",
+            format!(
+                "{}\n⬇ {}\n💾 {}",
                 self.get_download_animation(),
                 active_count,
-                cached_count)
+                cached_count
+            )
         } else {
             format!("💾\n{}\ncached", cached_count)
         };
@@ -1096,31 +1189,27 @@ impl MusicPlayerApp {
         let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         match self.mode {
-            AppMode::LoginPrompt => {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
-                    KeyCode::Char('l') | KeyCode::Char('L') => {
-                        self.start_login().await;
-                    }
-                    _ => {}
+            AppMode::LoginPrompt => match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
+                KeyCode::Char('l') | KeyCode::Char('L') => {
+                    self.start_login().await;
                 }
-            }
-            AppMode::AccountPicker => {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                        self.mode = AppMode::LoginPrompt;
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => self.next_account(),
-                    KeyCode::Char('k') | KeyCode::Up => self.prev_account(),
-                    KeyCode::Enter => {
-                        self.select_account().await;
-                    }
-                    _ => {}
+                _ => {}
+            },
+            AppMode::AccountPicker => match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                    self.mode = AppMode::LoginPrompt;
                 }
-            }
+                KeyCode::Char('j') | KeyCode::Down => self.next_account(),
+                KeyCode::Char('k') | KeyCode::Up => self.prev_account(),
+                KeyCode::Enter => {
+                    self.select_account().await;
+                }
+                _ => {}
+            },
             AppMode::Searching => {
                 match key.code {
-                    KeyCode::Char(c) => {
+                    KeyCode::Char(c) if self.search_query.len() < MAX_SEARCH_QUERY_LEN => {
                         self.search_query.push(c);
                     }
                     KeyCode::Backspace => {
@@ -1131,7 +1220,7 @@ impl MusicPlayerApp {
                         self.perform_search(&query).await;
                         self.mode = AppMode::Normal;
                         // Switch to Search view
-                        self.previous_view = self.current_view.clone();
+                        self.previous_view = self.current_view;
                         self.current_view = ViewMode::Search;
                         self.search_query.clear();
                     }
@@ -1139,47 +1228,41 @@ impl MusicPlayerApp {
                         self.mode = AppMode::Normal;
                         self.search_query.clear();
                         // Return to previous view
-                        let temp = self.current_view.clone();
-                        self.current_view = self.previous_view.clone();
-                        self.previous_view = temp;
+                        std::mem::swap(&mut self.current_view, &mut self.previous_view);
                     }
                     _ => {}
                 }
             }
-            AppMode::LoadingPlaylist => {
-                match key.code {
-                    KeyCode::Char(c) => {
-                        self.playlist_url.push(c);
-                    }
-                    KeyCode::Backspace => {
-                        self.playlist_url.pop();
-                    }
-                    KeyCode::Enter => {
-                        let url = self.playlist_url.clone();
-                        if !url.is_empty() {
-                            self.load_playlist_from_url(&url).await;
-                        }
-                        self.mode = AppMode::Normal;
-                        self.playlist_url.clear();
-                        self.playlist_loading_expanded = false;
-                    }
-                    KeyCode::Esc => {
-                        self.mode = AppMode::Normal;
-                        self.playlist_url.clear();
-                        self.playlist_loading_expanded = false;
-                        self.status_message = "Cancelled playlist loading".to_string();
-                    }
-                    _ => {}
+            AppMode::LoadingPlaylist => match key.code {
+                KeyCode::Char(c) if self.playlist_url.len() < MAX_PLAYLIST_URL_LEN => {
+                    self.playlist_url.push(c);
                 }
-            }
-            AppMode::Help => {
-                match key.code {
-                    KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
-                        self.mode = AppMode::Normal;
-                    }
-                    _ => {}
+                KeyCode::Backspace => {
+                    self.playlist_url.pop();
                 }
-            }
+                KeyCode::Enter => {
+                    let url = self.playlist_url.clone();
+                    if !url.is_empty() {
+                        self.load_playlist_from_url(&url).await;
+                    }
+                    self.mode = AppMode::Normal;
+                    self.playlist_url.clear();
+                    self.playlist_loading_expanded = false;
+                }
+                KeyCode::Esc => {
+                    self.mode = AppMode::Normal;
+                    self.playlist_url.clear();
+                    self.playlist_loading_expanded = false;
+                    self.status_message = "Cancelled playlist loading".to_string();
+                }
+                _ => {}
+            },
+            AppMode::Help => match key.code {
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.mode = AppMode::Normal;
+                }
+                _ => {}
+            },
             AppMode::Normal => {
                 match key.code {
                     KeyCode::Char('q') => self.should_quit = true,
@@ -1190,7 +1273,8 @@ impl MusicPlayerApp {
                         self.mode = AppMode::LoadingPlaylist;
                         self.playlist_loading_expanded = true;
                         self.playlist_url.clear();
-                        self.status_message = "Enter playlist URL (YouTube or YouTube Music)".to_string();
+                        self.status_message =
+                            "Enter playlist URL (YouTube or YouTube Music)".to_string();
                     }
                     KeyCode::Char(' ') => self.toggle_pause_or_start().await,
                     KeyCode::Char('h') | KeyCode::Char('H') => {
@@ -1198,13 +1282,14 @@ impl MusicPlayerApp {
                             // Shift+H: Toggle history expansion
                             self.history_expanded = !self.history_expanded;
                             self.status_message = if self.history_expanded {
-                                "History expanded - use j/k to navigate, Shift+C to clear".to_string()
+                                "History expanded - use j/k to navigate, Shift+C to clear"
+                                    .to_string()
                             } else {
                                 "History collapsed".to_string()
                             };
                         } else {
                             // h: Go to home view
-                            self.previous_view = self.current_view.clone();
+                            self.previous_view = self.current_view;
                             self.current_view = ViewMode::Home;
                             self.status_message = "Returned to Home (My Mix)".to_string();
                         }
@@ -1220,7 +1305,8 @@ impl MusicPlayerApp {
                             // m: Toggle My Mix expansion
                             self.my_mix_expanded = !self.my_mix_expanded;
                             self.status_message = if self.my_mix_expanded {
-                                "My Mix expanded - use j/k to navigate, Shift+m to refresh".to_string()
+                                "My Mix expanded - use j/k to navigate, Shift+m to refresh"
+                                    .to_string()
                             } else {
                                 "My Mix collapsed".to_string()
                             };
@@ -1235,10 +1321,8 @@ impl MusicPlayerApp {
                     }
                     KeyCode::Esc => {
                         // Return to previous view
-                        let temp = self.current_view.clone();
-                        self.current_view = self.previous_view.clone();
-                        self.previous_view = temp;
-                        self.status_message = format!("Returned to previous view");
+                        std::mem::swap(&mut self.current_view, &mut self.previous_view);
+                        self.status_message = "Returned to previous view".to_string();
                     }
                     KeyCode::Char('n') => {
                         self.status_message = "Playing next track...".to_string();
@@ -1333,54 +1417,14 @@ impl MusicPlayerApp {
         });
     }
 
-
     async fn play_next(&mut self) {
-        // NOTE: No trigger_smart_downloads() here - sliding window handles it!
         // CRITICAL: Clear pending state FIRST so navigation always works
         self.pending_play_track = None;
         self.currently_downloading = None;
 
-        // Pure next - always advances to next track (use SPACE to start first track!)
         if let Some(track) = self.queue.next() {
-            // Limit history to 100 most recent tracks to prevent memory issues
             self.queue.limit_history(100);
-
-            // Check if already in cache
-            let cached_file = self.downloaded_files.lock().ok()
-                .and_then(|files| files.get(&track.video_id).cloned());
-
-            if let Some(local_file) = cached_file {
-                // Verify file actually exists before playing (5-min cleanup might have deleted it)
-                if std::path::Path::new(&local_file).exists() {
-                    // ✅ INSTANT PLAYBACK - Already in cache!
-                    self.player.play_with_duration(&local_file, &track.title, track.duration as f64);
-                    self.status_message = "".to_string();  // Clear status - player shows track
-
-                    // PROACTIVE: Ensure next track is downloading for instant skip
-                    self.ensure_next_track_ready();
-                } else {
-                    // File was deleted - remove from cache and re-download
-                    self.downloaded_files.lock().ok().map(|mut files| files.remove(&track.video_id));
-                    self.pending_play_track = Some(track.clone());
-                    if self.spawn_download_with_limit(&track) {
-                        self.currently_downloading = Some(track.title.clone());
-                    }
-                }
-            } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
-                // Not in cache - spawn download (rate-limited!)
-                // Always set pending track (even if rate limited - will retry when slot opens)
-                self.pending_play_track = Some(track.clone());
-
-                // Only set downloading state if spawn succeeds
-                if self.spawn_download_with_limit(&track) {
-                    self.currently_downloading = Some(track.title.clone());
-                }
-                // If rate limited, silent - will auto-retry when download slot opens
-            } else {
-                // Direct URL (not YouTube)
-                self.player.play_with_duration(&track.url, &track.title, track.duration as f64);
-                self.status_message = "".to_string();  // Clear status - player shows track
-            }
+            self.play_track_from_cache_or_download(&track);
         } else {
             self.status_message = "Queue is empty!".to_string();
         }
@@ -1392,47 +1436,55 @@ impl MusicPlayerApp {
         self.currently_downloading = None;
 
         if let Some(track) = self.queue.previous() {
-            // Limit history to 100 most recent tracks to prevent memory issues
             self.queue.limit_history(100);
-
-            // Check if already in cache
-            let cached_file = self.downloaded_files.lock().ok()
-                .and_then(|files| files.get(&track.video_id).cloned());
-
-            if let Some(local_file) = cached_file {
-                // Verify file actually exists before playing (5-min cleanup might have deleted it)
-                if std::path::Path::new(&local_file).exists() {
-                    // ✅ INSTANT PLAYBACK - Already in cache!
-                    self.player.play_with_duration(&local_file, &track.title, track.duration as f64);
-                    self.status_message = "".to_string();  // Clear status - player shows track
-
-                    // PROACTIVE: Ensure next track is downloading for instant skip
-                    self.ensure_next_track_ready();
-                } else {
-                    // File was deleted - remove from cache and re-download
-                    self.downloaded_files.lock().ok().map(|mut files| files.remove(&track.video_id));
-                    self.pending_play_track = Some(track.clone());
-                    if self.spawn_download_with_limit(&track) {
-                        self.currently_downloading = Some(track.title.clone());
-                    }
-                }
-            } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
-                // Not in cache - spawn download (rate-limited!)
-                // Always set pending track (even if rate limited - will retry when slot opens)
-                self.pending_play_track = Some(track.clone());
-
-                // Only set downloading state if spawn succeeds
-                if self.spawn_download_with_limit(&track) {
-                    self.currently_downloading = Some(track.title.clone());
-                }
-                // If rate limited, silent - will auto-retry when download slot opens
-            } else {
-                // Direct URL (not YouTube)
-                self.player.play_with_duration(&track.url, &track.title, track.duration as f64);
-                self.status_message = "".to_string();  // Clear status - player shows track
-            }
+            self.play_track_from_cache_or_download(&track);
         } else {
             self.status_message = "No previous track!".to_string();
+        }
+    }
+
+    // ==========================================
+    // CENTRALIZED PLAY-FROM-CACHE-OR-DOWNLOAD
+    // ==========================================
+    // Single method that handles the "check cache -> play or download" logic.
+    // All play methods (play_next, play_previous, play_selected_queue_track,
+    // play_current_or_first) delegate to this to avoid duplication.
+    fn play_track_from_cache_or_download(&mut self, track: &Track) {
+        // Check if already in cache
+        let cached_file = self
+            .downloaded_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&track.video_id)
+            .cloned();
+
+        if let Some(local_file) = cached_file {
+            // Verify file actually exists before playing (cleanup might have deleted it)
+            if std::path::Path::new(&local_file).exists() {
+                self.player
+                    .play_with_duration(&local_file, &track.title, track.duration as f64);
+                self.status_message.clear();
+                self.ensure_next_track_ready();
+            } else {
+                // File was deleted - remove from cache and re-download
+                self.downloaded_files
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&track.video_id);
+                self.pending_play_track = Some(track.clone());
+                if self.spawn_download_with_limit(track) {
+                    self.currently_downloading = Some(track.title.clone());
+                }
+            }
+        } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
+            // Not in cache - spawn download (rate-limited)
+            self.pending_play_track = Some(track.clone());
+            if self.spawn_download_with_limit(track) {
+                self.currently_downloading = Some(track.title.clone());
+            }
+        } else {
+            // Direct URL (not YouTube) - reject non-YouTube URLs for safety
+            self.status_message = "Cannot play non-YouTube URL".to_string();
         }
     }
 
@@ -1450,12 +1502,12 @@ impl MusicPlayerApp {
     fn spawn_download_with_limit(&self, track: &Track) -> bool {
         // RATE LIMIT: Allow up to 30 concurrent downloads for fast bulk downloading
         // Increased from 15 to improve performance, especially when window is unfocused
-        let active_count = {
-            let count = self.active_downloads.lock().ok();
-            count.map(|c| *c).unwrap_or(0)
-        };
+        let active_count = *self
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
-        if active_count >= 30 {
+        if active_count >= MAX_CONCURRENT_DOWNLOADS {
             // Already at max downloads, skip
             return false;
         }
@@ -1463,36 +1515,49 @@ impl MusicPlayerApp {
         let video_id = &track.video_id;
 
         // Skip if already downloaded
-        if let Ok(files) = self.downloaded_files.lock() {
-            if files.contains_key(video_id) {
-                return false;  // Already in cache
-            }
+        if self
+            .downloaded_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(video_id)
+        {
+            return false; // Already in cache
         }
 
         // Skip if download already failed (will retry when playing)
-        if let Ok(failed) = self.failed_downloads.lock() {
-            if failed.contains_key(video_id) {
-                return false;  // Known failure
-            }
+        if self
+            .failed_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(video_id)
+        {
+            return false; // Known failure
         }
 
         // CRITICAL: Skip if already downloading (prevents SPACE spam duplicates!)
-        if let Ok(mut downloading) = self.downloading_videos.lock() {
+        {
+            let mut downloading = self
+                .downloading_videos
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if downloading.contains(video_id) {
-                return false;  // Already downloading this video
+                return false; // Already downloading this video
             }
             // Mark as downloading
             downloading.insert(video_id.clone());
         }
 
         // Increment active download counter
-        if let Ok(mut count) = self.active_downloads.lock() {
-            *count += 1;
-        }
+        *self
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) += 1;
 
         let video_id = track.video_id.clone();
         let youtube_url = track.url.clone();
-        let cookie_config = self.browser_auth.load_selected_account()
+        let cookie_config = self
+            .browser_auth
+            .load_selected_account()
             .map(|account| self.browser_auth.get_cookie_arg(&account));
         let downloaded_files = self.downloaded_files.clone();
         let failed_downloads = self.failed_downloads.clone();
@@ -1503,48 +1568,60 @@ impl MusicPlayerApp {
         let handle = tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 Self::fetch_audio_url_blocking(&youtube_url, cookie_config)
-            }).await;
+            })
+            .await;
 
             match result {
                 Ok(Ok(file_path)) => {
                     // Add to cache
-                    if let Ok(mut files) = downloaded_files.lock() {
-                        files.insert(video_id.clone(), file_path.clone());
-                    }
+                    downloaded_files
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(video_id.clone(), file_path.clone());
                     // Notify main thread with ACTUAL file path (for auto-play if pending)
                     let _ = download_tx.send((video_id.clone(), Ok(file_path)));
                 }
                 Ok(Err(e)) => {
-                    if let Ok(mut failed) = failed_downloads.lock() {
-                        failed.insert(video_id.clone(), e.clone());
-                    }
+                    failed_downloads
+                        .lock()
+                        .unwrap_or_else(|e2| e2.into_inner())
+                        .insert(video_id.clone(), e.clone());
                     let _ = download_tx.send((video_id.clone(), Err(e)));
                 }
                 Err(e) => {
-                    let error_msg = format!("Task error: {}", e);
-                    if let Ok(mut failed) = failed_downloads.lock() {
-                        failed.insert(video_id.clone(), error_msg.clone());
-                    }
+                    let error_msg = "Download task failed unexpectedly".to_string();
+                    eprintln!("Download task join error: {}", e);
+                    failed_downloads
+                        .lock()
+                        .unwrap_or_else(|e2| e2.into_inner())
+                        .insert(video_id.clone(), error_msg.clone());
                     let _ = download_tx.send((video_id.clone(), Err(error_msg)));
                 }
             }
 
             // IMPORTANT: Decrement active download count and remove from in-flight tracker
-            if let Ok(mut count) = active_downloads.lock() {
+            {
+                let mut count = active_downloads.lock().unwrap_or_else(|e| e.into_inner());
                 *count = count.saturating_sub(1);
             }
             // Remove from downloading tracker (allows retry if user presses SPACE again)
-            if let Ok(mut downloading) = downloading_videos.lock() {
-                downloading.remove(&video_id);
-            }
+            downloading_videos
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&video_id);
         });
 
-        // Track the background task for proper cleanup
-        if let Ok(mut tasks) = self.background_tasks.lock() {
+        // Track the background task for proper cleanup, pruning finished tasks
+        {
+            let mut tasks = self
+                .background_tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            tasks.retain(|h| !h.is_finished());
             tasks.push(handle);
         }
 
-        true  // Download was spawned
+        true // Download was spawned
     }
 
     // Trigger smart downloads: download tracks near current position
@@ -1581,7 +1658,7 @@ impl MusicPlayerApp {
     // Clean up old pre-downloaded files from temp directory
     fn cleanup_old_downloads() {
         use std::env;
-        use std::time::{SystemTime, Duration};
+        use std::time::{Duration, SystemTime};
 
         let temp_dir = env::temp_dir();
 
@@ -1612,31 +1689,47 @@ impl MusicPlayerApp {
     }
 
     // Helper to download audio to temp file using yt-dlp
-    fn fetch_audio_url_blocking(youtube_url: &str, cookie_config: Option<(bool, String)>) -> Result<String, String> {
-        use std::process::Command;
+    fn fetch_audio_url_blocking(
+        youtube_url: &str,
+        cookie_config: Option<(bool, String)>,
+    ) -> Result<String, String> {
         use std::env;
+        use std::process::Command;
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Validate URL before passing to yt-dlp
+        if !is_allowed_youtube_url(youtube_url) {
+            return Err("Invalid URL: must be a YouTube or YouTube Music URL".to_string());
+        }
 
         // Create unique temp file path for audio download
         let temp_dir = env::temp_dir();
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_micros();
-        let temp_file = temp_dir.join(format!("yt-music-audio-{}-{}.%(ext)s", std::process::id(), timestamp));
+        let temp_file = temp_dir.join(format!(
+            "yt-music-audio-{}-{}.%(ext)s",
+            std::process::id(),
+            timestamp
+        ));
 
         let mut cmd = Command::new("yt-dlp");
         cmd.arg("-f")
-            .arg("bestaudio/best")  // Get best audio
-            .arg("-x")              // Extract audio only
+            .arg("bestaudio/best") // Get best audio
+            .arg("-x") // Extract audio only
             .arg("--audio-format")
-            .arg("mp3")             // Convert to MP3 (universally supported)
+            .arg("mp3") // Convert to MP3 (universally supported)
             .arg("--audio-quality")
-            .arg("192K")            // 192 kbps bitrate
+            .arg("192K") // 192 kbps bitrate
             .arg("-o")
-            .arg(&temp_file)        // Output to temp file (yt-dlp will replace %(ext)s)
-            .arg("--no-playlist")   // Don't download playlists
-            .arg("--no-mtime");     // Don't preserve modification time
+            .arg(&temp_file) // Output to temp file (yt-dlp will replace %(ext)s)
+            .arg("--no-playlist") // Don't download playlists
+            .arg("--no-mtime") // Don't preserve modification time
+            .arg("--socket-timeout")
+            .arg("30")
+            .arg("--retries")
+            .arg("2");
 
         // Add cookies from browser if available
         if let Some((_use_from_browser, cookie_arg)) = cookie_config {
@@ -1646,12 +1739,15 @@ impl MusicPlayerApp {
         cmd.arg(youtube_url);
 
         // Run yt-dlp and wait for completion
-        let output = cmd.output()
+        let output = cmd
+            .output()
             .map_err(|e| format!("Failed to run yt-dlp: {}. Is yt-dlp installed?", e))?;
 
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("yt-dlp download failed: {}", error));
+            // Log full error for debugging but return sanitized message to UI
+            eprintln!("yt-dlp download error: {}", error);
+            return Err("yt-dlp download failed — check logs for details".to_string());
         }
 
         // yt-dlp replaces %(ext)s with actual extension, so find the file
@@ -1663,20 +1759,35 @@ impl MusicPlayerApp {
             .map_err(|e| format!("Failed to read temp dir: {}", e))?
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
-                entry.file_name()
+                entry
+                    .file_name()
                     .to_string_lossy()
                     .starts_with(&search_pattern)
             })
             .collect();
 
         if files.is_empty() {
-            return Err(format!("yt-dlp completed but no audio file found (searched for {}.*)", search_pattern));
+            return Err(format!(
+                "yt-dlp completed but no audio file found (searched for {}.*)",
+                search_pattern
+            ));
         }
 
         let downloaded_file = files[0].path();
 
+        // Canonicalize and verify the file is within the temp directory
+        let canonical = downloaded_file
+            .canonicalize()
+            .map_err(|e| format!("Failed to canonicalize downloaded file path: {}", e))?;
+        let temp_canonical = temp_dir_path
+            .canonicalize()
+            .map_err(|e| format!("Failed to canonicalize temp dir: {}", e))?;
+        if !canonical.starts_with(&temp_canonical) {
+            return Err("Downloaded file path is outside temp directory".to_string());
+        }
+
         // Verify file exists and has content
-        let metadata = std::fs::metadata(&downloaded_file)
+        let metadata = std::fs::metadata(&canonical)
             .map_err(|e| format!("Failed to check downloaded file: {}", e))?;
 
         if metadata.len() == 0 {
@@ -1684,13 +1795,13 @@ impl MusicPlayerApp {
         }
 
         if metadata.len() < 10000 {
-            return Err(format!("Downloaded file is too small ({} bytes), likely incomplete", metadata.len()));
+            return Err(format!(
+                "Downloaded file is too small ({} bytes), likely incomplete",
+                metadata.len()
+            ));
         }
 
-        // Give extra time for file system to finish writing
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        Ok(downloaded_file.to_string_lossy().to_string())
+        Ok(canonical.to_string_lossy().to_string())
     }
 
     async fn toggle_pause_or_start(&mut self) {
@@ -1706,7 +1817,9 @@ impl MusicPlayerApp {
         } else if self.queue.get_current().is_none() && !self.queue.is_empty() {
             // Nothing playing but queue has tracks - START PLAYING!
             self.play_current_or_first().await;
-        } else if self.player.get_state() == PlayerState::Stopped && self.queue.get_current().is_some() {
+        } else if self.player.get_state() == PlayerState::Stopped
+            && self.queue.get_current().is_some()
+        {
             // Player stopped but track exists in queue - RELOAD IT!
             self.play_current_or_first().await;
         } else {
@@ -1737,33 +1850,11 @@ impl MusicPlayerApp {
         }
 
         // Set as current track
-        self.queue.restore_queue(self.queue.get_queue_list(), Some(track.clone()));
+        self.queue
+            .restore_queue(self.queue.get_queue_list(), Some(track.clone()));
 
         // Now play it
-        let cached_file = self.downloaded_files.lock().ok()
-            .and_then(|files| files.get(&track.video_id).cloned());
-
-        if let Some(local_file) = cached_file {
-            // ✅ INSTANT PLAYBACK - Already in cache!
-            self.player.play_with_duration(&local_file, &track.title, track.duration as f64);
-            self.status_message = "".to_string();  // Clear status - player shows track
-
-            // PROACTIVE: Ensure next track is downloading for instant skip
-            self.ensure_next_track_ready();
-        } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
-            // Not in cache - spawn download (rate-limited!)
-            // Always set pending track (even if rate limited - will retry when slot opens)
-            self.pending_play_track = Some(track.clone());
-
-            // Only set downloading state if spawn succeeds
-            if self.spawn_download_with_limit(&track) {
-                self.currently_downloading = Some(track.title.clone());
-            }
-        } else {
-            // Direct URL (not YouTube)
-            self.player.play_with_duration(&track.url, &track.title, track.duration as f64);
-            self.status_message = "".to_string();  // Clear status - player shows track
-        }
+        self.play_track_from_cache_or_download(&track);
 
         // Collapse queue after selection
         self.queue_expanded = false;
@@ -1787,32 +1878,8 @@ impl MusicPlayerApp {
             return;
         };
 
-        // Now play the track (with smart pre-download logic)
-        let cached_file = self.downloaded_files.lock().ok()
-            .and_then(|files| files.get(&track.video_id).cloned());
-
-        if let Some(local_file) = cached_file {
-            // ✅ INSTANT PLAYBACK - Already in cache!
-            self.player.play_with_duration(&local_file, &track.title, track.duration as f64);
-            self.status_message = "".to_string();  // Clear status - player shows track
-
-            // PROACTIVE: Ensure next track is downloading for instant skip
-            self.ensure_next_track_ready();
-        } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
-            // Not in cache - spawn download (rate-limited!)
-            // Always set pending track (even if rate limited - will retry when slot opens)
-            self.pending_play_track = Some(track.clone());
-
-            // Only set downloading state if spawn succeeds
-            if self.spawn_download_with_limit(&track) {
-                self.currently_downloading = Some(track.title.clone());
-            }
-            // If rate limited, silent - will auto-retry when download slot opens
-        } else {
-            // Direct URL (not YouTube)
-            self.player.play_with_duration(&track.url, &track.title, track.duration as f64);
-            self.status_message = "".to_string();  // Clear status - player shows track
-        }
+        // Play the track using centralized cache-or-download logic
+        self.play_track_from_cache_or_download(&track);
     }
 
     fn volume_up(&mut self, has_shift: bool) {
@@ -1835,14 +1902,14 @@ impl MusicPlayerApp {
         // Seek forward 10 seconds
         self.player.seek_relative(10.0);
         self.player.apply_seek();
-        self.status_message = format!("Seeked +10s ({})", Self::format_time(self.player.get_time_pos()));
+        self.status_message = format!("Seeked +10s ({})", format_time(self.player.get_time_pos()));
     }
 
     fn seek_backward(&mut self) {
         // Seek backward 10 seconds
         self.player.seek_relative(-10.0);
         self.player.apply_seek();
-        self.status_message = format!("Seeked -10s ({})", Self::format_time(self.player.get_time_pos()));
+        self.status_message = format!("Seeked -10s ({})", format_time(self.player.get_time_pos()));
     }
 
     fn next_search_result(&mut self) {
@@ -1902,7 +1969,7 @@ impl MusicPlayerApp {
     fn delete_selected_queue_item(&mut self) {
         if self.queue_expanded && !self.queue.is_empty() {
             if let Some(removed_track) = self.queue.remove_at(self.selected_queue_item) {
-                let clean_title = Self::clean_title(&removed_track.title);
+                let clean_title = clean_title(&removed_track.title);
                 self.status_message = format!("Removed '{}' from queue", clean_title);
 
                 // Adjust selection if needed
@@ -1968,19 +2035,28 @@ impl MusicPlayerApp {
     }
 
     async fn load_playlist_from_url(&mut self, url: &str) {
-        self.status_message = format!("⏳ Loading playlist... (this may take a moment)");
+        // Validate URL is a known YouTube domain before passing to yt-dlp
+        if !is_allowed_youtube_url(url) {
+            self.status_message = "Invalid URL: must be a YouTube or YouTube Music URL".to_string();
+            return;
+        }
+
+        self.status_message = "Loading playlist... (this may take a moment)".to_string();
 
         // Yield to allow UI to render the loading message before blocking fetch
         tokio::task::yield_now().await;
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let cookie_config = self.browser_auth.load_selected_account()
+        let cookie_config = self
+            .browser_auth
+            .load_selected_account()
             .map(|account| self.browser_auth.get_cookie_arg(&account));
 
         let playlist_url = url.to_string();
         let fetch_result = tokio::task::spawn_blocking(move || {
             Self::fetch_playlist_tracks_blocking(&playlist_url, cookie_config)
-        }).await;
+        })
+        .await;
 
         match fetch_result {
             Ok(Ok(tracks)) => {
@@ -1991,27 +2067,31 @@ impl MusicPlayerApp {
 
                 let track_count = tracks.len();
 
-                // Store loaded playlist for display
-                self.loaded_playlist_tracks = tracks.clone();
                 self.loaded_playlist_name = format!("Loaded Playlist ({} tracks)", track_count);
 
-                // Add tracks to queue (filter out tracks > 5 minutes = 300 seconds)
+                // Add tracks to queue (filter out tracks > 5 minutes)
                 let mut added_count = 0;
                 let mut filtered_count = 0;
-                for track in tracks {
-                    if track.duration <= 300 {
-                        self.queue.add(track);
+                for track in &tracks {
+                    if track.duration <= MAX_TRACK_DURATION_SECS {
+                        self.queue.add(track.clone());
                         added_count += 1;
                     } else {
                         filtered_count += 1;
                     }
                 }
 
+                // Store loaded playlist for display (moved after iteration to avoid clone)
+                self.loaded_playlist_tracks = tracks;
+
                 // Trigger smart downloads - downloads next 15 + previous 5
                 self.trigger_smart_downloads();
 
                 if filtered_count > 0 {
-                    self.status_message = format!("Added {} tracks to queue ({} long tracks filtered out)", added_count, filtered_count);
+                    self.status_message = format!(
+                        "Added {} tracks to queue ({} long tracks filtered out)",
+                        added_count, filtered_count
+                    );
                 } else {
                     self.status_message = format!("Added {} tracks to queue", added_count);
                 }
@@ -2030,19 +2110,25 @@ impl MusicPlayerApp {
 
     async fn add_selected_mix_to_queue(&mut self) {
         if let Some(mix) = self.my_mix_playlists.get(self.selected_mix_item).cloned() {
-            self.status_message = format!("⏳ Fetching tracks from '{}'... (this may take a moment)", mix.title);
+            self.status_message = format!(
+                "⏳ Fetching tracks from '{}'... (this may take a moment)",
+                mix.title
+            );
 
             // Yield to allow UI to render the loading message before blocking fetch
             tokio::task::yield_now().await;
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-            let cookie_config = self.browser_auth.load_selected_account()
+            let cookie_config = self
+                .browser_auth
+                .load_selected_account()
                 .map(|account| self.browser_auth.get_cookie_arg(&account));
 
             let playlist_url = mix.url.clone();
             let fetch_result = tokio::task::spawn_blocking(move || {
                 Self::fetch_playlist_tracks_blocking(&playlist_url, cookie_config)
-            }).await;
+            })
+            .await;
 
             match fetch_result {
                 Ok(Ok(tracks)) => {
@@ -2051,13 +2137,11 @@ impl MusicPlayerApp {
                         return;
                     }
 
-                    let _track_count = tracks.len();
-
                     // Add tracks to queue (filter out tracks > 5 minutes = 300 seconds)
                     let mut added_count = 0;
                     let mut filtered_count = 0;
                     for track in tracks {
-                        if track.duration <= 300 {
+                        if track.duration <= MAX_TRACK_DURATION_SECS {
                             self.queue.add(track);
                             added_count += 1;
                         } else {
@@ -2069,9 +2153,13 @@ impl MusicPlayerApp {
                     self.trigger_smart_downloads();
 
                     if filtered_count > 0 {
-                        self.status_message = format!("Added {} tracks from '{}' ({} long tracks filtered out)", added_count, mix.title, filtered_count);
+                        self.status_message = format!(
+                            "Added {} tracks from '{}' ({} long tracks filtered out)",
+                            added_count, mix.title, filtered_count
+                        );
                     } else {
-                        self.status_message = format!("Added {} tracks from '{}' to queue", added_count, mix.title);
+                        self.status_message =
+                            format!("Added {} tracks from '{}' to queue", added_count, mix.title);
                     }
 
                     // Save queue to disk
@@ -2089,13 +2177,25 @@ impl MusicPlayerApp {
         }
     }
 
-    fn fetch_playlist_tracks_blocking(playlist_url: &str, cookie_config: Option<(bool, String)>) -> Result<Vec<Track>, String> {
+    fn fetch_playlist_tracks_blocking(
+        playlist_url: &str,
+        cookie_config: Option<(bool, String)>,
+    ) -> Result<Vec<Track>, String> {
         use std::process::Command;
+
+        // Validate URL before passing to yt-dlp
+        if !is_allowed_youtube_url(playlist_url) {
+            return Err("Invalid URL: must be a YouTube or YouTube Music URL".to_string());
+        }
 
         let mut cmd = Command::new("yt-dlp");
         cmd.arg("--flat-playlist")
             .arg("--dump-json")
-            .arg("--no-warnings");
+            .arg("--no-warnings")
+            .arg("--socket-timeout")
+            .arg("30")
+            .arg("--retries")
+            .arg("2");
 
         // Add cookies from browser if available
         if let Some((_use_from_browser, cookie_arg)) = cookie_config {
@@ -2104,16 +2204,18 @@ impl MusicPlayerApp {
 
         cmd.arg(playlist_url);
 
-        let output = cmd.output()
+        let output = cmd
+            .output()
             .map_err(|e| format!("Failed to run yt-dlp: {}. Is yt-dlp installed?", e))?;
 
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("yt-dlp failed: {}", error));
+            eprintln!("yt-dlp playlist error: {}", error);
+            return Err("yt-dlp failed — check logs for details".to_string());
         }
 
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|e| format!("Invalid UTF-8: {}", e))?;
+        let stdout =
+            String::from_utf8(output.stdout).map_err(|e| format!("Invalid UTF-8: {}", e))?;
 
         let mut tracks = Vec::new();
 
@@ -2125,13 +2227,14 @@ impl MusicPlayerApp {
 
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
                 let video_id = json["id"].as_str().unwrap_or("").to_string();
-                if video_id.is_empty() {
+                if !extractor::is_valid_video_id(&video_id) {
                     continue;
                 }
 
                 let title = json["title"].as_str().unwrap_or("Unknown").to_string();
                 let duration = json["duration"].as_u64().unwrap_or(0);
-                let uploader = json["uploader"].as_str()
+                let uploader = json["uploader"]
+                    .as_str()
                     .or_else(|| json["channel"].as_str())
                     .unwrap_or("Unknown")
                     .to_string();
@@ -2151,12 +2254,13 @@ impl MusicPlayerApp {
 
     async fn fetch_my_mix(&mut self) {
         // Fetch My Mix playlists using yt-dlp
-        let cookie_config = self.browser_auth.load_selected_account()
+        let cookie_config = self
+            .browser_auth
+            .load_selected_account()
             .map(|account| self.browser_auth.get_cookie_arg(&account));
 
-        let fetch_result = tokio::task::spawn_blocking(move || {
-            Self::fetch_my_mix_blocking(cookie_config)
-        }).await;
+        let fetch_result =
+            tokio::task::spawn_blocking(move || Self::fetch_my_mix_blocking(cookie_config)).await;
 
         match fetch_result {
             Ok(Ok(playlists)) => {
@@ -2164,7 +2268,8 @@ impl MusicPlayerApp {
                     self.status_message = "No My Mix playlists found".to_string();
                 } else {
                     self.my_mix_playlists = playlists;
-                    self.status_message = format!("Loaded {} My Mix playlists", self.my_mix_playlists.len());
+                    self.status_message =
+                        format!("Loaded {} My Mix playlists", self.my_mix_playlists.len());
                 }
             }
             Ok(Err(e)) => {
@@ -2177,14 +2282,20 @@ impl MusicPlayerApp {
         }
     }
 
-    fn fetch_my_mix_blocking(cookie_config: Option<(bool, String)>) -> Result<Vec<MixPlaylist>, String> {
+    fn fetch_my_mix_blocking(
+        cookie_config: Option<(bool, String)>,
+    ) -> Result<Vec<MixPlaylist>, String> {
         use std::process::Command;
 
         let mut cmd = Command::new("yt-dlp");
         cmd.arg("--flat-playlist")
             .arg("--dump-json")
             .arg("--no-warnings")
-            .arg("--skip-download");
+            .arg("--skip-download")
+            .arg("--socket-timeout")
+            .arg("30")
+            .arg("--retries")
+            .arg("2");
 
         // Add cookies from browser if available
         if let Some((_use_from_browser, cookie_arg)) = cookie_config {
@@ -2193,16 +2304,18 @@ impl MusicPlayerApp {
 
         cmd.arg("https://music.youtube.com");
 
-        let output = cmd.output()
+        let output = cmd
+            .output()
             .map_err(|e| format!("Failed to run yt-dlp: {}. Is yt-dlp installed?", e))?;
 
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("yt-dlp failed: {}", error));
+            eprintln!("yt-dlp my mix error: {}", error);
+            return Err("yt-dlp failed — check logs for details".to_string());
         }
 
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|e| format!("Invalid UTF-8: {}", e))?;
+        let stdout =
+            String::from_utf8(output.stdout).map_err(|e| format!("Invalid UTF-8: {}", e))?;
 
         let mut playlists = Vec::new();
 
@@ -2216,33 +2329,39 @@ impl MusicPlayerApp {
                 // Check if this is a playlist entry
                 if let Some(entry_type) = json["_type"].as_str() {
                     if entry_type == "playlist" || entry_type == "url" {
-                        let playlist_id = json["id"].as_str()
+                        let playlist_id = json["id"]
+                            .as_str()
                             .or_else(|| json["playlist_id"].as_str())
                             .unwrap_or("")
                             .to_string();
 
-                        let title = json["title"].as_str()
+                        let title = json["title"]
+                            .as_str()
                             .or_else(|| json["playlist_title"].as_str())
                             .unwrap_or("Untitled Mix")
                             .to_string();
 
-                        let track_count = json["playlist_count"].as_u64()
+                        let track_count = json["playlist_count"]
+                            .as_u64()
                             .or_else(|| json["n_entries"].as_u64())
                             .unwrap_or(0) as usize;
 
-                        let url = json["url"].as_str()
+                        let url = json["url"]
+                            .as_str()
                             .or_else(|| json["webpage_url"].as_str())
                             .map(|s| s.to_string())
-                            .unwrap_or_else(|| format!("https://music.youtube.com/playlist?list={}", playlist_id));
+                            .unwrap_or_else(|| {
+                                format!("https://music.youtube.com/playlist?list={}", playlist_id)
+                            });
 
                         // Filter for My Mix playlists (auto-generated mixes)
                         // These typically have IDs starting with "RDCLAK", "RDAMPL", or contain "Mix" in title
                         if playlist_id.starts_with("RDCLAK")
                             || playlist_id.starts_with("RDAMPL")
                             || title.contains("Mix")
-                            || title.contains("mix") {
+                            || title.contains("mix")
+                        {
                             playlists.push(MixPlaylist {
-                                _id: playlist_id,
                                 title,
                                 track_count,
                                 url,
@@ -2259,10 +2378,13 @@ impl MusicPlayerApp {
     fn add_selected_to_queue(&mut self) {
         if let Some(video) = self.search_results.get(self.selected_result) {
             // Filter out tracks > 5 minutes (300 seconds) - this is a music player!
-            if video.duration > 300 {
-                let clean_title = Self::clean_title(&video.title);
+            if video.duration > MAX_TRACK_DURATION_SECS {
+                let clean_title = clean_title(&video.title);
                 let mins = video.duration / 60;
-                self.status_message = format!("'{}' is too long ({}min) - music only (<5min)", clean_title, mins);
+                self.status_message = format!(
+                    "'{}' is too long ({}min) - music only (<5min)",
+                    clean_title, mins
+                );
                 return;
             }
 
@@ -2276,56 +2398,22 @@ impl MusicPlayerApp {
 
             let was_empty = self.queue.is_empty();
 
-            // Start background download for this track
-            let video_id = track.video_id.clone();
-            let youtube_url = track.url.clone();
-            let cookie_config = self.browser_auth.load_selected_account()
-                .map(|account| self.browser_auth.get_cookie_arg(&account));
-            let downloaded_files = self.downloaded_files.clone();
-            let failed_downloads = self.failed_downloads.clone();
-
-            // Spawn background download
-            let handle = tokio::spawn(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    Self::fetch_audio_url_blocking(&youtube_url, cookie_config)
-                }).await;
-
-                match result {
-                    Ok(Ok(file_path)) => {
-                        // Store the downloaded file path
-                        if let Ok(mut files) = downloaded_files.lock() {
-                            files.insert(video_id, file_path);
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        // Track failed download (yt-dlp error)
-                        if let Ok(mut failed) = failed_downloads.lock() {
-                            failed.insert(video_id, e);
-                        }
-                    }
-                    Err(e) => {
-                        // Track failed download (task join error)
-                        let error_msg = format!("Task error: {}", e);
-                        if let Ok(mut failed) = failed_downloads.lock() {
-                            failed.insert(video_id, error_msg);
-                        }
-                    }
-                }
-            });
-
-            // Track the background task for proper cleanup
-            if let Ok(mut tasks) = self.background_tasks.lock() {
-                tasks.push(handle);
-            }
+            // Start background download through centralized rate-limited system
+            self.spawn_download_with_limit(&track);
 
             self.queue.add(track);
 
             // Show feedback
-            let clean_title = Self::clean_title(&video.title);
-            self.status_message = format!("Added '{}' to queue! Downloading in background... ({} total)", clean_title, self.queue.len());
+            let clean_title = clean_title(&video.title);
+            self.status_message = format!(
+                "Added '{}' to queue! Downloading in background... ({} total)",
+                clean_title,
+                self.queue.len()
+            );
 
             if was_empty {
-                self.status_message = format!("Added '{}' to queue! Press 'n' to play", clean_title);
+                self.status_message =
+                    format!("Added '{}' to queue! Press 'n' to play", clean_title);
             }
 
             // Save queue to disk
@@ -2335,18 +2423,6 @@ impl MusicPlayerApp {
         }
     }
 
-    fn format_time(seconds: f64) -> String {
-        let mins = (seconds / 60.0) as u64;
-        let secs = (seconds % 60.0) as u64;
-        format!("{:02}:{:02}", mins, secs)
-    }
-
-    fn clean_title(title: &str) -> &str {
-        // Just return the title as-is for now - fast path
-        // We can add smarter cleaning later if needed
-        title
-    }
-
     async fn start_login(&mut self) {
         self.status_message = "Detecting YouTube accounts from browsers...".to_string();
 
@@ -2354,9 +2430,14 @@ impl MusicPlayerApp {
         self.available_accounts = self.browser_auth.detect_accounts();
 
         if self.available_accounts.is_empty() {
-            self.status_message = "No browser accounts found. Please login to YouTube in Chrome or Firefox first.".to_string();
+            self.status_message =
+                "No browser accounts found. Please login to YouTube in Chrome or Firefox first."
+                    .to_string();
         } else {
-            self.status_message = format!("Found {} account(s). Select one:", self.available_accounts.len());
+            self.status_message = format!(
+                "Found {} account(s). Select one:",
+                self.available_accounts.len()
+            );
             self.selected_account_idx = 0;
             self.mode = AppMode::AccountPicker;
         }
@@ -2364,7 +2445,8 @@ impl MusicPlayerApp {
 
     fn next_account(&mut self) {
         if !self.available_accounts.is_empty() {
-            self.selected_account_idx = (self.selected_account_idx + 1) % self.available_accounts.len();
+            self.selected_account_idx =
+                (self.selected_account_idx + 1) % self.available_accounts.len();
         }
     }
 
@@ -2382,7 +2464,10 @@ impl MusicPlayerApp {
         if let Some(account) = self.available_accounts.get(self.selected_account_idx) {
             match self.browser_auth.save_selected_account(account) {
                 Ok(_) => {
-                    self.status_message = format!("✓ Logged in as {} - Press '/' to search for music!", account.display_name);
+                    self.status_message = format!(
+                        "✓ Logged in as {} - Press '/' to search for music!",
+                        account.display_name
+                    );
                     self.mode = AppMode::Normal;
                 }
                 Err(e) => {
@@ -2402,20 +2487,25 @@ impl MusicPlayerApp {
                 Constraint::Min(10),
                 Constraint::Percentage(20),
             ])
-            .split(frame.size());
+            .split(frame.area());
 
         // Header
-        let header_text = vec![
+        let header_text = [
             "Select YouTube Account",
             "",
             "Use j/k or ↑/↓ to navigate",
             "Press Enter to select",
             "Press Esc to go back",
             "",
-        ].join("\n");
+        ]
+        .join("\n");
 
         let header = Paragraph::new(header_text)
-            .block(Block::default().borders(Borders::ALL).title("Account Selection"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Account Selection"),
+            )
             .style(Style::default().fg(Color::Cyan))
             .alignment(Alignment::Center);
 
@@ -2427,9 +2517,11 @@ impl MusicPlayerApp {
             .iter()
             .enumerate()
             .map(|(i, account)| {
-                let content = format!("{}", account.display_name);
+                let content = account.display_name.clone();
                 let style = if i == self.selected_account_idx {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -2437,8 +2529,11 @@ impl MusicPlayerApp {
             })
             .collect();
 
-        let account_list = List::new(account_items)
-            .block(Block::default().borders(Borders::ALL).title("Available Accounts"));
+        let account_list = List::new(account_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Available Accounts"),
+        );
 
         frame.render_widget(account_list, chunks[1]);
     }
@@ -2453,7 +2548,7 @@ impl MusicPlayerApp {
                 Constraint::Min(10),
                 Constraint::Percentage(10),
             ])
-            .split(frame.size());
+            .split(frame.area());
 
         let help_text = vec![
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━ KEYBINDS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -2492,7 +2587,8 @@ impl MusicPlayerApp {
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
             "",
             "Press '?', 'Esc', or 'q' to close this help screen",
-        ].join("\n");
+        ]
+        .join("\n");
 
         let help_widget = Paragraph::new(help_text)
             .block(Block::default().borders(Borders::ALL).title("Help"))
@@ -2503,8 +2599,8 @@ impl MusicPlayerApp {
     }
 
     fn draw_login_screen(&self, frame: &mut Frame) {
-        use ratatui::widgets::Paragraph;
         use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+        use ratatui::widgets::Paragraph;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -2513,9 +2609,9 @@ impl MusicPlayerApp {
                 Constraint::Length(10),
                 Constraint::Percentage(40),
             ])
-            .split(frame.size());
+            .split(frame.area());
 
-        let login_text = vec![
+        let login_text = [
             "YouTube Music Player",
             "",
             "Welcome! To access YouTube Music, you'll select",
@@ -2531,10 +2627,15 @@ impl MusicPlayerApp {
             } else {
                 ""
             },
-        ].join("\n");
+        ]
+        .join("\n");
 
         let login_widget = Paragraph::new(login_text)
-            .block(Block::default().borders(Borders::ALL).title("Login Required"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Login Required"),
+            )
             .style(Style::default().fg(Color::White))
             .alignment(Alignment::Center);
 

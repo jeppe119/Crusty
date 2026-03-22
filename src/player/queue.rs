@@ -68,7 +68,7 @@ pub struct Track {
     pub duration: u64,
     pub uploader: String,
     pub url: String,
-    pub local_file: Option<String>,  // Path to pre-downloaded file
+    pub local_file: Option<String>, // Path to pre-downloaded file
 }
 
 // ==========================================
@@ -115,7 +115,7 @@ impl Track {
             duration,
             uploader,
             url,
-            local_file: None,  // Not pre-downloaded yet
+            local_file: None, // Not pre-downloaded yet
         }
     }
 }
@@ -417,14 +417,11 @@ impl Queue {
     // - Display only visible portion of queue in UI
     // - Avoid cloning hundreds of tracks when only showing 10
     pub fn get_queue_slice(&self, start: usize, count: usize) -> Vec<&Track> {
-        self.tracks
-            .iter()
-            .skip(start)
-            .take(count)
-            .collect()
+        self.tracks.iter().skip(start).take(count).collect()
     }
 
-    // Get queue length without cloning
+    /// Returns the number of tracks in the queue (excluding current and history).
+    #[must_use]
     pub fn len(&self) -> usize {
         self.tracks.len()
     }
@@ -471,30 +468,9 @@ impl Queue {
     // Example:
     // - Queue: [], Current: A, History: [B]
     // - is_empty() returns true (queue empty even though A is playing)
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tracks.is_empty()
-    }
-
-    // ==========================================
-    // QUEUE INSPECTION: size()
-    // ==========================================
-    // Gets the number of tracks in the queue.
-    //
-    // Returns: usize
-    // - Number of tracks waiting to be played
-    // - Does NOT include current_track or history
-    // - 0 means queue is empty
-    //
-    // Use cases:
-    // - Display "3 tracks in queue" in UI
-    // - Check if queue has enough tracks before shuffle/repeat
-    // - Validate index before remove()
-    //
-    // Example:
-    // - Queue: [A, B, C], Current: D, History: [E]
-    // - size() returns 3 (only counts A, B, C)
-    pub fn size(&self) -> usize {
-        self.tracks.len()
     }
 
     // ==========================================
@@ -536,6 +512,7 @@ impl Queue {
     //
     // - Current: None
     // - get_current() returns None
+    #[must_use]
     pub fn get_current(&self) -> Option<&Track> {
         self.current_track.as_ref()
     }
@@ -553,7 +530,8 @@ impl Queue {
     // Use case:
     // - Display "Recently Played" list in UI
     // - Show what tracks were played in this session
-    pub fn get_history(&self) -> &Vec<Track> {
+    #[must_use]
+    pub fn get_history(&self) -> &[Track] {
         &self.history
     }
 
@@ -648,36 +626,243 @@ impl Queue {
     }
 }
 
-// ==========================================
-// FUTURE IMPROVEMENTS
-// ==========================================
-// Features to add later:
-//
-// 1. Shuffle mode
-//    - Randomize queue order
-//    - Keep track of shuffle state
-//    - Un-shuffle to restore original order
-//
-// 2. Repeat mode
-//    - Repeat all: Loop queue when it ends
-//    - Repeat one: Keep playing current track
-//    - No repeat: Stop at end
-//
-// 3. Save/load queue
-//    - Serialize queue to JSON
-//    - Save to file on exit
-//    - Load on startup to resume session
-//
-// 4. Queue reordering
-//    - Move track from index A to index B
-//    - Drag-and-drop in UI
-//
-// 5. Smart queue management
-//    - Limit history size (e.g., keep last 50 tracks)
-//    - Auto-remove duplicates
-//    - Priority tracks (play next vs add to end)
-//
-// 6. Statistics
-//    - Track play counts
-//    - Total playtime
-//    - Most played tracks
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_track(id: &str) -> Track {
+        Track::new(
+            id.to_string(),
+            format!("Track {id}"),
+            120,
+            "Uploader".to_string(),
+            format!("https://www.youtube.com/watch?v={id}"),
+        )
+    }
+
+    #[test]
+    fn test_new_queue_is_empty() {
+        let queue = Queue::new();
+        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
+        assert!(queue.get_current().is_none());
+        assert!(queue.get_history().is_empty());
+    }
+
+    #[test]
+    fn test_add_increases_length() {
+        let mut queue = Queue::new();
+        queue.add(make_track("a"));
+        assert_eq!(queue.len(), 1);
+        assert!(!queue.is_empty());
+        queue.add(make_track("b"));
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn test_next_moves_track_to_current() {
+        let mut queue = Queue::new();
+        queue.add(make_track("a"));
+        queue.add(make_track("b"));
+
+        let track = queue.next();
+        assert!(track.is_some());
+        assert_eq!(track.unwrap().video_id, "a");
+        assert_eq!(queue.get_current().unwrap().video_id, "a");
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn test_next_saves_current_to_history() {
+        let mut queue = Queue::new();
+        queue.add(make_track("a"));
+        queue.add(make_track("b"));
+
+        queue.next(); // current = a
+        queue.next(); // current = b, history = [a]
+
+        assert_eq!(queue.get_current().unwrap().video_id, "b");
+        assert_eq!(queue.get_history().len(), 1);
+        assert_eq!(queue.get_history()[0].video_id, "a");
+    }
+
+    #[test]
+    fn test_next_returns_none_when_empty() {
+        let mut queue = Queue::new();
+        assert!(queue.next().is_none());
+        assert!(queue.get_current().is_none());
+    }
+
+    #[test]
+    fn test_previous_goes_back() {
+        let mut queue = Queue::new();
+        queue.add(make_track("a"));
+        queue.add(make_track("b"));
+        queue.add(make_track("c"));
+
+        queue.next(); // current = a
+        queue.next(); // current = b, history = [a]
+
+        let prev = queue.previous();
+        assert!(prev.is_some());
+        assert_eq!(prev.unwrap().video_id, "a");
+        assert_eq!(queue.get_current().unwrap().video_id, "a");
+        // b should be pushed back to front of queue
+        assert_eq!(queue.len(), 2); // [b, c]
+    }
+
+    #[test]
+    fn test_previous_returns_none_without_history() {
+        let mut queue = Queue::new();
+        queue.add(make_track("a"));
+        queue.next(); // current = a, history = []
+
+        assert!(queue.previous().is_none());
+    }
+
+    #[test]
+    fn test_remove_at_valid_index() {
+        let mut queue = Queue::new();
+        queue.add(make_track("a"));
+        queue.add(make_track("b"));
+        queue.add(make_track("c"));
+
+        let removed = queue.remove_at(1);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().video_id, "b");
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_at_invalid_index() {
+        let mut queue = Queue::new();
+        queue.add(make_track("a"));
+        assert!(queue.remove_at(5).is_none());
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn test_get_queue_list_clones() {
+        let mut queue = Queue::new();
+        queue.add(make_track("a"));
+        queue.add(make_track("b"));
+
+        let list = queue.get_queue_list();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].video_id, "a");
+        assert_eq!(list[1].video_id, "b");
+    }
+
+    #[test]
+    fn test_get_queue_slice() {
+        let mut queue = Queue::new();
+        for i in 0..10 {
+            queue.add(make_track(&i.to_string()));
+        }
+
+        let slice = queue.get_queue_slice(2, 3);
+        assert_eq!(slice.len(), 3);
+        assert_eq!(slice[0].video_id, "2");
+        assert_eq!(slice[2].video_id, "4");
+    }
+
+    #[test]
+    fn test_get_queue_slice_beyond_bounds() {
+        let mut queue = Queue::new();
+        queue.add(make_track("a"));
+
+        let slice = queue.get_queue_slice(0, 100);
+        assert_eq!(slice.len(), 1);
+    }
+
+    #[test]
+    fn test_start_or_next_starts_first() {
+        let mut queue = Queue::new();
+        queue.add(make_track("a"));
+        queue.add(make_track("b"));
+
+        // First call: should start first track (not skip it)
+        let track = queue.start_or_next();
+        assert_eq!(track.unwrap().video_id, "a");
+        assert!(queue.get_history().is_empty()); // No history yet
+
+        // Second call: should advance to next
+        let track = queue.start_or_next();
+        assert_eq!(track.unwrap().video_id, "b");
+        assert_eq!(queue.get_history().len(), 1);
+    }
+
+    #[test]
+    fn test_clear_history() {
+        let mut queue = Queue::new();
+        queue.add(make_track("a"));
+        queue.add(make_track("b"));
+        queue.next();
+        queue.next();
+        assert_eq!(queue.get_history().len(), 1);
+
+        queue.clear_history();
+        assert!(queue.get_history().is_empty());
+    }
+
+    #[test]
+    fn test_limit_history_trims_oldest() {
+        let mut queue = Queue::new();
+        for i in 0..10 {
+            queue.add_to_history(make_track(&i.to_string()));
+        }
+        assert_eq!(queue.get_history().len(), 10);
+
+        queue.limit_history(3);
+        assert_eq!(queue.get_history().len(), 3);
+        // Should keep newest: 7, 8, 9
+        assert_eq!(queue.get_history()[0].video_id, "7");
+        assert_eq!(queue.get_history()[2].video_id, "9");
+    }
+
+    #[test]
+    fn test_limit_history_no_op_when_under() {
+        let mut queue = Queue::new();
+        queue.add_to_history(make_track("a"));
+        queue.limit_history(100);
+        assert_eq!(queue.get_history().len(), 1);
+    }
+
+    #[test]
+    fn test_restore_queue() {
+        let mut queue = Queue::new();
+        let tracks = vec![make_track("a"), make_track("b")];
+        let current = Some(make_track("c"));
+
+        queue.restore_queue(tracks, current);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.get_current().unwrap().video_id, "c");
+    }
+
+    #[test]
+    fn test_add_to_history() {
+        let mut queue = Queue::new();
+        queue.add_to_history(make_track("x"));
+        assert_eq!(queue.get_history().len(), 1);
+        assert_eq!(queue.get_history()[0].video_id, "x");
+    }
+
+    #[test]
+    fn test_next_previous_roundtrip() {
+        let mut queue = Queue::new();
+        queue.add(make_track("a"));
+        queue.add(make_track("b"));
+        queue.add(make_track("c"));
+
+        queue.next(); // current=a, queue=[b,c], history=[]
+        queue.next(); // current=b, queue=[c], history=[a]
+        queue.next(); // current=c, queue=[], history=[a,b]
+
+        queue.previous(); // current=b, queue=[c], history=[a]
+        queue.previous(); // current=a, queue=[b,c], history=[]
+
+        assert_eq!(queue.get_current().unwrap().video_id, "a");
+        assert_eq!(queue.len(), 2);
+        assert!(queue.get_history().is_empty());
+    }
+}
