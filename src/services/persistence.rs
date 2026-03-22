@@ -1,7 +1,8 @@
 //! Persistence service for saving and loading history and queue state.
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -16,7 +17,7 @@ const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const MAX_ENTRY_COUNT: usize = 10_000;
 
 /// Maximum number of history entries to persist.
-const MAX_HISTORY_SIZE: usize = 100;
+pub(crate) const MAX_HISTORY_SIZE: usize = 100;
 
 /// Handles reading and writing history/queue state to disk.
 pub(crate) struct PersistenceService {
@@ -24,37 +25,54 @@ pub(crate) struct PersistenceService {
 }
 
 impl PersistenceService {
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let config_dir = config::config_dir()?;
         Ok(Self { config_dir })
     }
 
+    pub(crate) fn from_dir(config_dir: PathBuf) -> Self {
+        Self { config_dir }
+    }
+
+    pub(crate) fn config_dir(&self) -> &Path {
+        &self.config_dir
+    }
+
     // -- History --------------------------------------------------------
 
-    pub fn load_history(&self) -> Result<Vec<Track>> {
+    pub(crate) fn load_history(&self) -> Result<Vec<Track>> {
         let path = self.config_dir.join("history.json");
 
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).context("Failed to open history file"),
+        };
 
-        let metadata = fs::metadata(&path).context("Failed to stat history file")?;
+        let metadata = file.metadata().context("Failed to stat history file")?;
         if metadata.len() > MAX_FILE_SIZE {
             anyhow::bail!("History file too large ({} bytes)", metadata.len());
         }
 
-        let contents = fs::read_to_string(&path).context("Failed to read history file")?;
-        let history: Vec<Track> =
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .context("Failed to read history file")?;
+        let mut history: Vec<Track> =
             serde_json::from_str(&contents).context("Failed to parse history file")?;
 
         if history.len() > MAX_ENTRY_COUNT {
             anyhow::bail!("History file contains too many entries ({})", history.len());
         }
 
+        // Strip fields that should not be restored from disk
+        for track in &mut history {
+            track.local_file = None;
+        }
+
         Ok(history)
     }
 
-    pub fn save_history(&self, history: &[Track]) -> Result<()> {
+    pub(crate) fn save_history(&self, history: &[Track]) -> Result<()> {
         fs::create_dir_all(&self.config_dir).context("Failed to create config directory")?;
 
         // Limit to most recent entries before serializing
@@ -66,30 +84,43 @@ impl PersistenceService {
 
         let path = self.config_dir.join("history.json");
         let json = serde_json::to_string_pretty(to_save).context("Failed to serialize history")?;
-        fs::write(path, json).context("Failed to write history file")?;
+        fs::write(&path, json).context("Failed to write history file")?;
+
+        // Restrict file permissions (owner read/write only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
 
         Ok(())
     }
 
     // -- Queue ----------------------------------------------------------
 
-    pub fn load_queue(&self) -> Result<QueueState> {
+    pub(crate) fn load_queue(&self) -> Result<QueueState> {
         let path = self.config_dir.join("queue.json");
 
-        if !path.exists() {
-            return Ok(QueueState {
-                tracks: Vec::new(),
-                current_track: None,
-            });
-        }
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(QueueState {
+                    tracks: Vec::new(),
+                    current_track: None,
+                });
+            }
+            Err(e) => return Err(e).context("Failed to open queue file"),
+        };
 
-        let metadata = fs::metadata(&path).context("Failed to stat queue file")?;
+        let metadata = file.metadata().context("Failed to stat queue file")?;
         if metadata.len() > MAX_FILE_SIZE {
             anyhow::bail!("Queue file too large ({} bytes)", metadata.len());
         }
 
-        let contents = fs::read_to_string(&path).context("Failed to read queue file")?;
-        let queue_state: QueueState =
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .context("Failed to read queue file")?;
+        let mut queue_state: QueueState =
             serde_json::from_str(&contents).context("Failed to parse queue file")?;
 
         if queue_state.tracks.len() > MAX_ENTRY_COUNT {
@@ -99,15 +130,29 @@ impl PersistenceService {
             );
         }
 
+        // Strip local_file paths that should not survive a restart
+        for track in &mut queue_state.tracks {
+            track.local_file = None;
+        }
+        if let Some(ref mut t) = queue_state.current_track {
+            t.local_file = None;
+        }
+
         Ok(queue_state)
     }
 
-    pub fn save_queue(&self, state: &QueueState) -> Result<()> {
+    pub(crate) fn save_queue(&self, state: &QueueState) -> Result<()> {
         fs::create_dir_all(&self.config_dir).context("Failed to create config directory")?;
 
         let path = self.config_dir.join("queue.json");
         let json = serde_json::to_string_pretty(state).context("Failed to serialize queue")?;
-        fs::write(path, json).context("Failed to write queue file")?;
+        fs::write(&path, json).context("Failed to write queue file")?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
 
         Ok(())
     }
@@ -116,7 +161,6 @@ impl PersistenceService {
 // -- History search/filter ----------------------------------------------
 
 /// Case-insensitive substring search across title and uploader fields.
-/// Will be wired to UI in the input handler extraction (Phase 6).
 #[allow(dead_code)]
 pub(crate) fn search_history<'a>(history: &'a [Track], query: &str) -> Vec<&'a Track> {
     if query.is_empty() {
@@ -149,9 +193,7 @@ mod tests {
     }
 
     fn service_in(dir: &std::path::Path) -> PersistenceService {
-        PersistenceService {
-            config_dir: dir.to_path_buf(),
-        }
+        PersistenceService::from_dir(dir.to_path_buf())
     }
 
     // -- History round-trip tests --
@@ -196,7 +238,6 @@ mod tests {
         let loaded = svc.load_history().unwrap();
 
         assert_eq!(loaded.len(), MAX_HISTORY_SIZE);
-        // Should keep the most recent (50..150)
         assert_eq!(loaded[0].video_id, "50");
         assert_eq!(loaded[99].video_id, "149");
     }
@@ -206,7 +247,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("history.json");
 
-        // Write a file larger than 10 MB
         let mut f = fs::File::create(&path).unwrap();
         let big_content = "x".repeat(11 * 1024 * 1024);
         f.write_all(big_content.as_bytes()).unwrap();
@@ -215,6 +255,20 @@ mod tests {
         let result = svc.load_history();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too large"));
+    }
+
+    #[test]
+    fn load_history_strips_local_file() {
+        let tmp = TempDir::new().unwrap();
+        let svc = service_in(tmp.path());
+
+        let mut track = make_track("a", "Song A", "Artist A");
+        track.local_file = Some("/tmp/evil.mp3".to_string());
+
+        svc.save_history(&[track]).unwrap();
+        let loaded = svc.load_history().unwrap();
+
+        assert!(loaded[0].local_file.is_none());
     }
 
     // -- Queue round-trip tests --
@@ -264,6 +318,25 @@ mod tests {
         let result = svc.load_queue();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too large"));
+    }
+
+    #[test]
+    fn load_queue_strips_local_file() {
+        let tmp = TempDir::new().unwrap();
+        let svc = service_in(tmp.path());
+
+        let mut track = make_track("a", "Song A", "Artist A");
+        track.local_file = Some("/tmp/evil.mp3".to_string());
+
+        let state = QueueState {
+            tracks: vec![track],
+            current_track: None,
+        };
+
+        svc.save_queue(&state).unwrap();
+        let loaded = svc.load_queue().unwrap();
+
+        assert!(loaded.tracks[0].local_file.is_none());
     }
 
     // -- search_history tests --

@@ -91,6 +91,7 @@ impl MusicPlayerApp {
             for track in history {
                 queue.add_to_history(track);
             }
+            queue.limit_history(crate::services::persistence::MAX_HISTORY_SIZE);
         }
 
         // Don't load queue at startup - it blocks with large queues
@@ -146,9 +147,9 @@ impl MusicPlayerApp {
             return; // Already loaded
         }
 
-        let result = tokio::task::spawn_blocking(|| -> Result<QueueState, String> {
-            let svc = crate::services::persistence::PersistenceService::new()
-                .map_err(|e| e.to_string())?;
+        let config_dir = self.persistence.config_dir().to_owned();
+        let result = tokio::task::spawn_blocking(move || -> Result<QueueState, String> {
+            let svc = PersistenceService::from_dir(config_dir);
             svc.load_queue().map_err(|e| e.to_string())
         })
         .await;
@@ -1029,7 +1030,7 @@ impl MusicPlayerApp {
 
             // Save to disk
             if let Err(e) = self.save_history() {
-                eprintln!("Failed to save history after delete: {}", e);
+                self.status_message = format!("Removed from history but save failed: {}", e);
             }
         }
     }
