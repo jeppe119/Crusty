@@ -21,11 +21,9 @@ use crate::player::audio::{AudioPlayer, PlayerState};
 use crate::player::queue::{Queue, Track};
 use crate::services::download::DownloadManager;
 use crate::services::persistence::PersistenceService;
-use crate::ui::state::{
-    AppMode, MixPlaylist, PlaylistState, QueueState, SearchState, UiState, ViewMode,
-};
+use crate::ui::state::{AppMode, PlaylistState, QueueState, SearchState, UiState, ViewMode};
 use crate::youtube::browser_auth::{BrowserAccount, BrowserAuth};
-use crate::youtube::extractor::{self, VideoInfo, YouTubeExtractor};
+use crate::youtube::extractor::{VideoInfo, YouTubeExtractor};
 
 pub struct MusicPlayerApp {
     // Core modules
@@ -1056,7 +1054,7 @@ impl MusicPlayerApp {
 
         let playlist_url = url.to_string();
         let fetch_result = tokio::task::spawn_blocking(move || {
-            Self::fetch_playlist_tracks_blocking(&playlist_url, cookie_config)
+            crate::services::playlist::fetch_playlist_tracks(&playlist_url, cookie_config)
         })
         .await;
 
@@ -1133,7 +1131,7 @@ impl MusicPlayerApp {
 
             let playlist_url = mix.url.clone();
             let fetch_result = tokio::task::spawn_blocking(move || {
-                Self::fetch_playlist_tracks_blocking(&playlist_url, cookie_config)
+                crate::services::playlist::fetch_playlist_tracks(&playlist_url, cookie_config)
             })
             .await;
 
@@ -1184,76 +1182,6 @@ impl MusicPlayerApp {
         }
     }
 
-    fn fetch_playlist_tracks_blocking(
-        playlist_url: &str,
-        cookie_config: Option<(bool, String)>,
-    ) -> Result<Vec<Track>, String> {
-        use std::process::Command;
-
-        // Validate URL before passing to yt-dlp
-        if !is_allowed_youtube_url(playlist_url) {
-            return Err("Invalid URL: must be a YouTube or YouTube Music URL".to_string());
-        }
-
-        let mut cmd = Command::new("yt-dlp");
-        cmd.arg("--flat-playlist")
-            .arg("--dump-json")
-            .arg("--no-warnings")
-            .arg("--socket-timeout")
-            .arg("30")
-            .arg("--retries")
-            .arg("2");
-
-        // Add cookies from browser if available
-        if let Some((_use_from_browser, cookie_arg)) = cookie_config {
-            cmd.arg("--cookies-from-browser").arg(cookie_arg);
-        }
-
-        cmd.arg(playlist_url);
-
-        let output = cmd
-            .output()
-            .map_err(|e| format!("Failed to run yt-dlp: {}. Is yt-dlp installed?", e))?;
-
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            eprintln!("yt-dlp playlist error: {}", error);
-            return Err("yt-dlp failed — check logs for details".to_string());
-        }
-
-        let stdout =
-            String::from_utf8(output.stdout).map_err(|e| format!("Invalid UTF-8: {}", e))?;
-
-        let mut tracks = Vec::new();
-
-        // Parse each line of JSON output
-        for line in stdout.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-                let video_id = json["id"].as_str().unwrap_or("").to_string();
-                if !extractor::is_valid_video_id(&video_id) {
-                    continue;
-                }
-
-                let title = json["title"].as_str().unwrap_or("Unknown").to_string();
-                let duration = json["duration"].as_u64().unwrap_or(0);
-                let uploader = json["uploader"]
-                    .as_str()
-                    .or_else(|| json["channel"].as_str())
-                    .unwrap_or("Unknown")
-                    .to_string();
-                let url = format!("https://www.youtube.com/watch?v={}", video_id);
-
-                tracks.push(Track::new(video_id, title, duration, uploader, url));
-            }
-        }
-
-        Ok(tracks)
-    }
-
     async fn refresh_my_mix(&mut self) {
         self.status_message = "Refreshing My Mix playlists...".to_string();
         self.fetch_my_mix().await;
@@ -1266,8 +1194,10 @@ impl MusicPlayerApp {
             .load_selected_account()
             .map(|account| self.browser_auth.get_cookie_arg(&account));
 
-        let fetch_result =
-            tokio::task::spawn_blocking(move || Self::fetch_my_mix_blocking(cookie_config)).await;
+        let fetch_result = tokio::task::spawn_blocking(move || {
+            crate::services::playlist::fetch_my_mix(cookie_config)
+        })
+        .await;
 
         match fetch_result {
             Ok(Ok(playlists)) => {
@@ -1289,99 +1219,6 @@ impl MusicPlayerApp {
                 self.status_message = format!("Task error: {}", e);
             }
         }
-    }
-
-    fn fetch_my_mix_blocking(
-        cookie_config: Option<(bool, String)>,
-    ) -> Result<Vec<MixPlaylist>, String> {
-        use std::process::Command;
-
-        let mut cmd = Command::new("yt-dlp");
-        cmd.arg("--flat-playlist")
-            .arg("--dump-json")
-            .arg("--no-warnings")
-            .arg("--skip-download")
-            .arg("--socket-timeout")
-            .arg("30")
-            .arg("--retries")
-            .arg("2");
-
-        // Add cookies from browser if available
-        if let Some((_use_from_browser, cookie_arg)) = cookie_config {
-            cmd.arg("--cookies-from-browser").arg(cookie_arg);
-        }
-
-        cmd.arg("https://music.youtube.com");
-
-        let output = cmd
-            .output()
-            .map_err(|e| format!("Failed to run yt-dlp: {}. Is yt-dlp installed?", e))?;
-
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            eprintln!("yt-dlp my mix error: {}", error);
-            return Err("yt-dlp failed — check logs for details".to_string());
-        }
-
-        let stdout =
-            String::from_utf8(output.stdout).map_err(|e| format!("Invalid UTF-8: {}", e))?;
-
-        let mut playlists = Vec::new();
-
-        // Parse each line of JSON output
-        for line in stdout.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-                // Check if this is a playlist entry
-                if let Some(entry_type) = json["_type"].as_str() {
-                    if entry_type == "playlist" || entry_type == "url" {
-                        let playlist_id = json["id"]
-                            .as_str()
-                            .or_else(|| json["playlist_id"].as_str())
-                            .unwrap_or("")
-                            .to_string();
-
-                        let title = json["title"]
-                            .as_str()
-                            .or_else(|| json["playlist_title"].as_str())
-                            .unwrap_or("Untitled Mix")
-                            .to_string();
-
-                        let track_count = json["playlist_count"]
-                            .as_u64()
-                            .or_else(|| json["n_entries"].as_u64())
-                            .unwrap_or(0) as usize;
-
-                        let url = json["url"]
-                            .as_str()
-                            .or_else(|| json["webpage_url"].as_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| {
-                                format!("https://music.youtube.com/playlist?list={}", playlist_id)
-                            });
-
-                        // Filter for My Mix playlists (auto-generated mixes)
-                        // These typically have IDs starting with "RDCLAK", "RDAMPL", or contain "Mix" in title
-                        if playlist_id.starts_with("RDCLAK")
-                            || playlist_id.starts_with("RDAMPL")
-                            || title.contains("Mix")
-                            || title.contains("mix")
-                        {
-                            playlists.push(MixPlaylist {
-                                title,
-                                track_count,
-                                url,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(playlists)
     }
 
     fn add_selected_to_queue(&mut self) {
