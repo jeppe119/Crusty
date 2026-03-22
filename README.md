@@ -98,7 +98,7 @@ cargo run
 
 | Key | Action |
 |-----|--------|
-| `Space` | Play/Pause |
+| `Space` | Play/Pause (smart: plays selected in queue, starts first track) |
 | `n` | Next track |
 | `p` | Previous track |
 | `j/k` | Navigate up/down in lists |
@@ -109,7 +109,13 @@ cargo run
 | `/` | Search YouTube |
 | `l` | Load playlist URL |
 | `t` | Toggle queue view |
+| `m` | Toggle My Mix view |
+| `Shift+M` | Refresh My Mix playlists |
+| `Shift+H` | Toggle history view |
+| `Shift+C` | Clear history (when expanded) |
+| `d` | Delete selected item |
 | `Enter` | Add to queue / Play selected |
+| `?` | Show help |
 | `q` | Quit |
 
 ---
@@ -124,23 +130,31 @@ Crusty/
 │   ├── Crusty.png
 │   └── screenshots/
 ├── docs/
-│   ├── RUST_CHEATSHEET.md
-│   └── TODO.md
 └── src/
     ├── main.rs
+    ├── config.rs               # Constants, paths, utilities
     │
     ├── player/
-    │   ├── mod.rs
-    │   ├── audio.rs        # Audio playback
-    │   └── queue.rs        # Queue management
+    │   ├── audio.rs            # Audio playback (rodio)
+    │   └── queue.rs            # Queue & history management
+    │
+    ├── services/
+    │   ├── download.rs         # Background download manager
+    │   ├── persistence.rs      # History/queue save/load (JSON)
+    │   └── playlist.rs         # Playlist & My Mix fetching
     │
     ├── youtube/
-    │   ├── mod.rs
-    │   └── extractor.rs    # yt-dlp interface
+    │   ├── browser_auth.rs     # Browser cookie authentication
+    │   └── extractor.rs        # yt-dlp search interface
     │
     └── ui/
-        ├── mod.rs
-        └── app.rs          # TUI rendering
+        ├── app.rs              # Main TUI app (event loop, draw)
+        ├── input.rs            # Keyboard input handling
+        ├── state.rs            # UI state structs
+        ├── playback.rs         # Play/pause/seek/volume
+        ├── navigation.rs       # List cursor movement
+        ├── actions.rs          # Search, playlist, login actions
+        └── views/              # 8 draw modules (search, queue, etc.)
 ```
 
 ---
@@ -201,7 +215,7 @@ async fn perform_search(&mut self, query: &str) {
 - Music-only filter (auto-filters tracks >5min)
 - Playlist loading indicator
 - Rolling download buffer
-- Smart download management (max 30 concurrent, proper prioritization)
+- Smart download management (max 5 concurrent, lookahead pre-downloading)
 
 ---
 
