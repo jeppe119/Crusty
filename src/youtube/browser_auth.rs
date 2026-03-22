@@ -20,12 +20,20 @@ pub struct BrowserAuth {
 }
 
 /// Returns true if a profile name is safe to embed in subprocess arguments.
-/// Only allows alphanumeric, dash, underscore, dot, and space characters.
+/// Allows alphanumeric, dash, underscore, dot, space, and parentheses.
+/// Parentheses are needed for Firefox/Zen profiles (e.g. "komel9o4.Default (release)").
+/// Safe because we pass via `.arg()`, not shell interpolation.
 fn is_safe_profile_name(name: &str) -> bool {
     !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ' ')
+        && name.chars().all(|c| {
+            c.is_alphanumeric()
+                || c == '-'
+                || c == '_'
+                || c == '.'
+                || c == ' '
+                || c == '('
+                || c == ')'
+        })
 }
 
 impl BrowserAuth {
@@ -250,10 +258,7 @@ impl BrowserAuth {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &config_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
         }
 
         Ok(())

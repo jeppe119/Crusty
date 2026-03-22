@@ -424,27 +424,47 @@ impl AudioPlayer {
     }
 
     /// Seek the audio stream to the stored position using rodio's native try_seek.
+    /// Falls back to reload-and-seek-forward for decoders that don't support backward seeks.
     pub fn apply_seek(&mut self) -> bool {
         let Some(seek_pos) = self.seek_position.take() else {
             return false;
         };
 
-        if let Some(player) = &self.player {
-            let target = std::time::Duration::from_secs_f64(seek_pos);
-            if player.try_seek(target).is_ok() {
-                // Adjust start_time so get_time_pos() reports correctly
-                if let Some(start) = self.start_time {
-                    let elapsed_before = std::time::Instant::now().duration_since(start)
-                        - self.total_paused_duration;
-                    let seek_dur = std::time::Duration::from_secs_f64(seek_pos);
-                    // Shift start_time so that elapsed matches seek_pos
-                    self.start_time =
-                        Some(std::time::Instant::now() - seek_dur - self.total_paused_duration);
-                    let _ = elapsed_before; // suppress unused
-                }
-                return true;
-            }
+        let target = std::time::Duration::from_secs_f64(seek_pos);
+
+        // Try native seek first (works for forward seeks on most decoders)
+        let native_ok = self
+            .player
+            .as_ref()
+            .is_some_and(|p| p.try_seek(target).is_ok());
+
+        if native_ok {
+            self.start_time = Some(
+                std::time::Instant::now()
+                    - std::time::Duration::from_secs_f64(seek_pos)
+                    - self.total_paused_duration,
+            );
+            return true;
         }
+
+        // Fallback: reload file and seek forward to target position
+        if let Some(file_path) = self.current_file_path.clone() {
+            let title = self.current_title.clone();
+            let duration = self.duration;
+            self.play_with_duration(&file_path, &title, duration);
+
+            // Now try_seek forward from 0 — this should always work
+            if let Some(player) = &self.player {
+                let _ = player.try_seek(target);
+            }
+            self.start_time = Some(
+                std::time::Instant::now()
+                    - std::time::Duration::from_secs_f64(seek_pos)
+                    - self.total_paused_duration,
+            );
+            return true;
+        }
+
         false
     }
 
