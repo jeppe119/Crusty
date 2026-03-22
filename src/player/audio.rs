@@ -423,26 +423,27 @@ impl AudioPlayer {
         self.seek_position = Some(target_position);
     }
 
-    // Actually perform the seek by reloading
+    /// Seek the audio stream to the stored position using rodio's native try_seek.
     pub fn apply_seek(&mut self) -> bool {
-        if let (Some(seek_pos), Some(file_path)) =
-            (self.seek_position, self.current_file_path.clone())
-        {
-            // Reload the track
-            let title = self.current_title.clone();
-            let duration = self.duration;
+        let Some(seek_pos) = self.seek_position.take() else {
+            return false;
+        };
 
-            // Play from beginning
-            self.play_with_duration(&file_path, &title, duration);
-
-            // Skip to target position by adjusting start_time
-            if let Some(start) = self.start_time {
-                let seek_duration = std::time::Duration::from_secs_f64(seek_pos);
-                self.start_time = Some(start - seek_duration);
+        if let Some(player) = &self.player {
+            let target = std::time::Duration::from_secs_f64(seek_pos);
+            if player.try_seek(target).is_ok() {
+                // Adjust start_time so get_time_pos() reports correctly
+                if let Some(start) = self.start_time {
+                    let elapsed_before = std::time::Instant::now().duration_since(start)
+                        - self.total_paused_duration;
+                    let seek_dur = std::time::Duration::from_secs_f64(seek_pos);
+                    // Shift start_time so that elapsed matches seek_pos
+                    self.start_time =
+                        Some(std::time::Instant::now() - seek_dur - self.total_paused_duration);
+                    let _ = elapsed_before; // suppress unused
+                }
+                return true;
             }
-
-            self.seek_position = None;
-            return true;
         }
         false
     }

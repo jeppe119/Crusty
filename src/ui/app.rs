@@ -16,10 +16,7 @@ use ratatui::{
 use std::io;
 use tokio::sync::mpsc;
 
-use crate::config::{
-    is_allowed_youtube_url, LOOKAHEAD_DOWNLOAD_COUNT, PLAYED_FILE_CLEANUP_DELAY_SECS,
-    STARTUP_DOWNLOAD_COUNT,
-};
+use crate::config::{is_allowed_youtube_url, LOOKAHEAD_DOWNLOAD_COUNT, STARTUP_DOWNLOAD_COUNT};
 use crate::player::audio::{AudioPlayer, PlayerState};
 use crate::player::queue::{Queue, Track};
 use crate::services::download::DownloadManager;
@@ -309,15 +306,9 @@ impl MusicPlayerApp {
                                 self.downloads
                                     .ensure_next_tracks_ready(&next, self.cookie_config());
 
-                                // Clean up the temp file after a delay
-                                let temp_path = temp_file_path.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(
-                                        PLAYED_FILE_CLEANUP_DELAY_SECS,
-                                    ))
-                                    .await;
-                                    let _ = std::fs::remove_file(&temp_path);
-                                });
+                                // No per-track cleanup — the hourly startup sweep
+                                // (cleanup_old_downloads) handles stale files.
+                                // Keeping files alive enables the persistent download cache.
                             }
                         }
 
@@ -356,6 +347,11 @@ impl MusicPlayerApp {
                         }
                     }
                 }
+
+                // Incrementally persist the download cache after each completion
+                let _ = self
+                    .persistence
+                    .save_download_cache(&self.downloads.get_cache_snapshot());
             }
 
             // Auto-advance to next track when current finishes
