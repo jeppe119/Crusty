@@ -391,20 +391,27 @@ impl MusicPlayerApp {
         self.downloads.abort_all();
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Save playback position for resume-on-restart
+        // Save playback state (position + volume) for resume-on-restart
+        let volume = self.player.get_volume();
         if let Some(current) = self.queue.get_current() {
-            let pos = self.player.get_time_pos();
-            if pos > 1.0 {
-                let state = crate::services::persistence::PlaybackState {
-                    video_id: current.video_id.clone(),
-                    position_secs: pos,
-                    title: current.title.clone(),
-                    duration: current.duration as f64,
-                };
-                let _ = self.persistence.save_playback_state(&state);
-            }
+            let state = crate::services::persistence::PlaybackState {
+                video_id: current.video_id.clone(),
+                position_secs: self.player.get_time_pos(),
+                title: current.title.clone(),
+                duration: current.duration as f64,
+                volume,
+            };
+            let _ = self.persistence.save_playback_state(&state);
         } else {
-            self.persistence.clear_playback_state();
+            // No track playing — still save volume
+            let state = crate::services::persistence::PlaybackState {
+                video_id: String::new(),
+                position_secs: 0.0,
+                title: String::new(),
+                duration: 0.0,
+                volume,
+            };
+            let _ = self.persistence.save_playback_state(&state);
         }
 
         // Save history, queue, and download cache before quitting

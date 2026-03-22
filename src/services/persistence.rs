@@ -250,6 +250,12 @@ pub(crate) struct PlaybackState {
     pub position_secs: f64,
     pub title: String,
     pub duration: f64,
+    #[serde(default = "default_volume")]
+    pub volume: u32,
+}
+
+fn default_volume() -> u32 {
+    100
 }
 
 // -- History search/filter ----------------------------------------------

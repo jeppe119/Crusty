@@ -194,6 +194,14 @@ impl MusicPlayerApp {
             return;
         };
 
+        // Always restore volume, even if track can't be resumed
+        self.player.set_volume(saved.volume);
+
+        // If no track was playing, just restore volume
+        if saved.video_id.is_empty() {
+            return;
+        }
+
         // Check if the track is still in the download cache
         let Some(file_path) = self.downloads.get_cached_file(&saved.video_id) else {
             return;
@@ -215,9 +223,10 @@ impl MusicPlayerApp {
         }
 
         self.status_message = format!(
-            "Resumed '{}' at {}",
+            "Resumed '{}' at {} (vol {}%)",
             saved.title,
-            format_time(saved.position_secs)
+            format_time(saved.position_secs),
+            saved.volume
         );
 
         // Clear the saved state so it doesn't re-trigger
