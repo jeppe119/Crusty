@@ -16,8 +16,8 @@ pub(crate) const MAX_SEARCH_QUERY_LEN: usize = 500;
 /// Maximum length for user-entered playlist URLs.
 pub(crate) const MAX_PLAYLIST_URL_LEN: usize = 2048;
 
-/// Maximum concurrent downloads.
-pub(crate) const MAX_CONCURRENT_DOWNLOADS: usize = 30;
+/// Maximum concurrent downloads (kept low to avoid resource exhaustion).
+pub(crate) const MAX_CONCURRENT_DOWNLOADS: usize = 5;
 
 /// Returns the application config directory path (e.g., `~/.config/youtube-music-player`).
 pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {

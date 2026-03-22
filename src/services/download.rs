@@ -13,9 +13,9 @@ pub(crate) type DownloadResult = (String, Result<String, String>);
 
 /// Manages background audio downloads with rate limiting and caching.
 pub(crate) struct DownloadManager {
-    pub downloaded_files: Arc<Mutex<HashMap<String, String>>>,
+    downloaded_files: Arc<Mutex<HashMap<String, String>>>,
     failed_downloads: Arc<Mutex<HashMap<String, String>>>,
-    pub active_downloads: Arc<Mutex<usize>>,
+    active_downloads: Arc<Mutex<usize>>,
     downloading_videos: Arc<Mutex<HashSet<String>>>,
     background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     download_tx: mpsc::UnboundedSender<DownloadResult>,
@@ -39,6 +39,22 @@ impl DownloadManager {
     /// Poll for a completed download without blocking.
     pub fn poll_completion(&mut self) -> Option<DownloadResult> {
         self.download_rx.try_recv().ok()
+    }
+
+    /// Returns the number of currently active downloads.
+    pub fn active_count(&self) -> usize {
+        *self
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Returns the number of cached (downloaded) files.
+    pub fn cached_count(&self) -> usize {
+        self.downloaded_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Returns true if the video is already cached.

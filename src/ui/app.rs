@@ -768,7 +768,7 @@ impl MusicPlayerApp {
                     self.currently_downloading = Some(track.title.clone());
                 }
             }
-        } else if track.url.contains("youtube.com") || track.url.contains("youtu.be") {
+        } else if is_allowed_youtube_url(&track.url) {
             self.pending_play_track = Some(track.clone());
             let cookie = self.cookie_config();
             if self.downloads.spawn_download(track, cookie) {
