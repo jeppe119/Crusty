@@ -151,7 +151,9 @@ pub(crate) fn key_to_command(key: KeyEvent, ctx: &InputContext<'_>) -> Option<Ap
             KeyCode::Char('m') if has_shift => Some(AppCommand::RefreshMix),
             KeyCode::Char('M') => Some(AppCommand::RefreshMix),
             KeyCode::Char('m') => Some(AppCommand::ToggleMixExpand),
-            KeyCode::Char('f') => Some(AppCommand::ToggleMusicOnlyMode),
+            KeyCode::Char('f') if has_shift => Some(AppCommand::ToggleMusicOnlyMode),
+            KeyCode::Char('F') => Some(AppCommand::ToggleMusicOnlyMode),
+            KeyCode::Char('f') => Some(AppCommand::OpenFeedBrowser),
             KeyCode::Char('d') | KeyCode::Char('D') => Some(AppCommand::Delete),
             KeyCode::Char('c') | KeyCode::Char('C') if has_shift && ctx.history_expanded => {
                 Some(AppCommand::ClearHistory)
@@ -488,5 +490,103 @@ mod tests {
     #[test]
     fn unknown_key_returns_none() {
         assert_eq!(cmd(key(KeyCode::F(12)), &AppMode::Normal, false), None);
+    }
+
+    // -- Feed browser keybind tests --
+
+    #[test]
+    fn normal_f_opens_feed_browser() {
+        assert_eq!(
+            cmd(key(KeyCode::Char('f')), &AppMode::Normal, false),
+            Some(AppCommand::OpenFeedBrowser)
+        );
+    }
+
+    #[test]
+    fn normal_shift_f_toggles_music_only() {
+        assert_eq!(
+            cmd(shift_key(KeyCode::Char('F')), &AppMode::Normal, false),
+            Some(AppCommand::ToggleMusicOnlyMode)
+        );
+    }
+
+    #[test]
+    fn feed_esc_closes() {
+        assert_eq!(
+            cmd(key(KeyCode::Esc), &AppMode::FeedBrowser, false),
+            Some(AppCommand::CloseFeedBrowser)
+        );
+    }
+
+    #[test]
+    fn feed_f_closes() {
+        assert_eq!(
+            cmd(key(KeyCode::Char('f')), &AppMode::FeedBrowser, false),
+            Some(AppCommand::CloseFeedBrowser)
+        );
+    }
+
+    #[test]
+    fn feed_r_refreshes() {
+        assert_eq!(
+            cmd(key(KeyCode::Char('r')), &AppMode::FeedBrowser, false),
+            Some(AppCommand::RefreshFeed)
+        );
+    }
+
+    #[test]
+    fn feed_j_navigates_down() {
+        assert_eq!(
+            cmd(key(KeyCode::Char('j')), &AppMode::FeedBrowser, false),
+            Some(AppCommand::FeedNavigateDown)
+        );
+    }
+
+    #[test]
+    fn feed_k_navigates_up() {
+        assert_eq!(
+            cmd(key(KeyCode::Char('k')), &AppMode::FeedBrowser, false),
+            Some(AppCommand::FeedNavigateUp)
+        );
+    }
+
+    #[test]
+    fn feed_l_next_section() {
+        assert_eq!(
+            cmd(key(KeyCode::Char('l')), &AppMode::FeedBrowser, false),
+            Some(AppCommand::FeedNextSection)
+        );
+    }
+
+    #[test]
+    fn feed_h_prev_section() {
+        assert_eq!(
+            cmd(key(KeyCode::Char('h')), &AppMode::FeedBrowser, false),
+            Some(AppCommand::FeedPrevSection)
+        );
+    }
+
+    #[test]
+    fn feed_enter_plays_now() {
+        assert_eq!(
+            cmd(key(KeyCode::Enter), &AppMode::FeedBrowser, false),
+            Some(AppCommand::FeedPlayNow)
+        );
+    }
+
+    #[test]
+    fn feed_a_adds_to_playlist() {
+        assert_eq!(
+            cmd(key(KeyCode::Char('a')), &AppMode::FeedBrowser, false),
+            Some(AppCommand::FeedAddToPlaylist)
+        );
+    }
+
+    #[test]
+    fn feed_q_quits() {
+        assert_eq!(
+            cmd(key(KeyCode::Char('q')), &AppMode::FeedBrowser, false),
+            Some(AppCommand::Quit)
+        );
     }
 }

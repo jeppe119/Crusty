@@ -21,7 +21,7 @@ use crate::player::audio::{AudioPlayer, PlayerState};
 use crate::player::queue::{Queue, Track};
 use crate::services::download::DownloadManager;
 use crate::services::persistence::PersistenceService;
-use crate::ui::state::{AppMode, PlaylistState, QueueState, SearchState, UiState, ViewMode};
+use crate::ui::state::{AppMode, FeedSection, FeedState, PlaylistState, QueueState, SearchState, UiState, ViewMode};
 use crate::youtube::browser_auth::{BrowserAccount, BrowserAuth};
 use crate::youtube::extractor::VideoInfo;
 
@@ -49,6 +49,11 @@ pub struct MusicPlayerApp {
     search_rx: mpsc::UnboundedReceiver<Vec<VideoInfo>>,
     pub(super) search_tx: mpsc::UnboundedSender<Vec<VideoInfo>>,
 
+    // Feed browser state + async channel
+    pub(crate) feed: FeedState,
+    feed_rx: mpsc::UnboundedReceiver<Result<Vec<FeedSection>, String>>,
+    pub(super) feed_tx: mpsc::UnboundedSender<Result<Vec<FeedSection>, String>>,
+
     // Playback state
     pub(super) pending_play_track: Option<Track>,
     pub(super) currently_downloading: Option<String>,
@@ -57,6 +62,7 @@ pub struct MusicPlayerApp {
 impl MusicPlayerApp {
     pub fn new() -> Result<Self> {
         let (search_tx, search_rx) = mpsc::unbounded_channel();
+        let (feed_tx, feed_rx) = mpsc::unbounded_channel();
 
         // Initialize browser auth (fallible — may fail if $HOME is unset or config dir is inaccessible)
         let browser_auth = BrowserAuth::new()
@@ -120,6 +126,9 @@ impl MusicPlayerApp {
             downloads: DownloadManager::with_cache(download_cache),
             search_rx,
             search_tx,
+            feed: FeedState::default(),
+            feed_rx,
+            feed_tx,
             pending_play_track: None,
             currently_downloading: None,
         })
@@ -283,6 +292,23 @@ impl MusicPlayerApp {
                 self.ui.selected_result = 0;
                 self.search.is_searching = false;
                 self.status_message = format!("Found {} results", self.search.results.len());
+            }
+
+            // Check for feed fetch results
+            if let Ok(result) = self.feed_rx.try_recv() {
+                self.feed.is_loading = false;
+                match result {
+                    Ok(sections) => {
+                        self.feed.sections = sections;
+                        self.feed.last_fetch = Some(std::time::Instant::now());
+                        self.feed.last_error = None;
+                        let total: usize = self.feed.sections.iter().map(|s| s.items.len()).sum();
+                        self.status_message = format!("Feed loaded — {} playlists", total);
+                    }
+                    Err(e) => {
+                        self.feed.last_error = Some(e);
+                    }
+                }
             }
 
             // Check for completed downloads
@@ -457,6 +483,12 @@ impl MusicPlayerApp {
         // Show help screen
         if matches!(self.mode, AppMode::Help) {
             views::help::draw_help_screen(self, frame);
+            return;
+        }
+
+        // Show feed browser (full-screen overlay)
+        if matches!(self.mode, AppMode::FeedBrowser) {
+            views::feed::draw(self, frame);
             return;
         }
 
@@ -737,37 +769,18 @@ impl MusicPlayerApp {
                 self.status_message = "Cancelled playlist loading".to_string();
             }
 
-            // Feed browser commands (Phase 2 will implement full handlers)
-            AppCommand::OpenFeedBrowser => {
-                self.mode = AppMode::FeedBrowser;
-            }
+            // Feed browser
+            AppCommand::OpenFeedBrowser => self.open_feed_browser().await,
             AppCommand::CloseFeedBrowser => {
                 self.mode = AppMode::Normal;
             }
-            AppCommand::RefreshFeed => {
-                // Full async implementation in Phase 2
-                self.status_message = "Feed refresh coming soon".to_string();
-            }
-            AppCommand::FeedNavigateDown => {
-                // Full implementation in Phase 2
-            }
-            AppCommand::FeedNavigateUp => {
-                // Full implementation in Phase 2
-            }
-            AppCommand::FeedNextSection => {
-                // Full implementation in Phase 2
-            }
-            AppCommand::FeedPrevSection => {
-                // Full implementation in Phase 2
-            }
-            AppCommand::FeedPlayNow => {
-                // Full implementation in Phase 3
-                self.status_message = "Feed play coming soon".to_string();
-            }
-            AppCommand::FeedAddToPlaylist => {
-                // Full implementation in Phase 3
-                self.status_message = "Feed import coming soon".to_string();
-            }
+            AppCommand::RefreshFeed => self.refresh_feed().await,
+            AppCommand::FeedNavigateDown => self.feed_navigate_down(),
+            AppCommand::FeedNavigateUp => self.feed_navigate_up(),
+            AppCommand::FeedNextSection => self.feed_next_section(),
+            AppCommand::FeedPrevSection => self.feed_prev_section(),
+            AppCommand::FeedPlayNow => self.feed_play_now().await,
+            AppCommand::FeedAddToPlaylist => self.feed_add_to_playlist().await,
         }
     }
 

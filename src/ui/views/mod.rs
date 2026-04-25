@@ -1,4 +1,5 @@
 pub(crate) mod cache_stats;
+pub(crate) mod feed;
 pub(crate) mod help;
 pub(crate) mod history;
 pub(crate) mod login;
