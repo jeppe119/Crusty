@@ -352,6 +352,13 @@ impl BrowserAuth {
         }
     }
 
+    /// Remove the saved account selection, effectively logging out.
+    /// The next `is_authenticated()` call will return `false`.
+    pub fn clear_selected_account(&self) {
+        let config_path = self.config_dir.join("selected_account.json");
+        let _ = std::fs::remove_file(config_path);
+    }
+
     // Check if user has selected an account
     pub fn is_authenticated(&self) -> bool {
         self.load_selected_account().is_some()

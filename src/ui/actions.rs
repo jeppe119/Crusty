@@ -357,7 +357,7 @@ impl MusicPlayerApp {
 
         self.feed.is_loading = true;
         self.feed.last_error = None;
-        self.status_message = "Fetching YouTube Music feed (home + library + liked)…".to_string();
+        self.status_message = "Fetching YouTube Music feed (liked songs + playlists)…".to_string();
 
         let cookie = self.cookie_config();
         let config_dir = self.persistence.config_dir().to_owned();
@@ -393,20 +393,46 @@ impl MusicPlayerApp {
     // Feed navigation helpers
 
     pub(super) fn feed_navigate_down(&mut self) {
-        let Some(section) = self.feed.sections.get(self.feed.selected_section) else {
-            return;
-        };
-        let max = section.items.len().saturating_sub(1);
-        if self.feed.selected_item < max {
-            self.feed.selected_item += 1;
+        use crate::ui::state::FeedFocus;
+        match self.feed.focus {
+            FeedFocus::Tracks => {
+                let max = self.feed.expanded_tracks.len().saturating_sub(1);
+                if self.feed.selected_track < max {
+                    self.feed.selected_track += 1;
+                }
+            }
+            FeedFocus::Playlists => {
+                let Some(section) = self.feed.sections.get(self.feed.selected_section) else {
+                    return;
+                };
+                let max = section.items.len().saturating_sub(1);
+                if self.feed.selected_item < max {
+                    self.feed.selected_item += 1;
+                }
+            }
         }
     }
 
     pub(super) fn feed_navigate_up(&mut self) {
-        self.feed.selected_item = self.feed.selected_item.saturating_sub(1);
+        use crate::ui::state::FeedFocus;
+        match self.feed.focus {
+            FeedFocus::Tracks => {
+                self.feed.selected_track = self.feed.selected_track.saturating_sub(1);
+            }
+            FeedFocus::Playlists => {
+                self.feed.selected_item = self.feed.selected_item.saturating_sub(1);
+            }
+        }
     }
 
     pub(super) fn feed_next_section(&mut self) {
+        use crate::ui::state::FeedFocus;
+        // If in track view, h/l collapses back to playlist view
+        if self.feed.focus == FeedFocus::Tracks {
+            self.feed.focus = FeedFocus::Playlists;
+            self.feed.expanded_tracks.clear();
+            return;
+        }
         if !self.feed.sections.is_empty() {
             let max = self.feed.sections.len() - 1;
             if self.feed.selected_section < max {
@@ -417,6 +443,12 @@ impl MusicPlayerApp {
     }
 
     pub(super) fn feed_prev_section(&mut self) {
+        use crate::ui::state::FeedFocus;
+        if self.feed.focus == FeedFocus::Tracks {
+            self.feed.focus = FeedFocus::Playlists;
+            self.feed.expanded_tracks.clear();
+            return;
+        }
         if self.feed.selected_section > 0 {
             self.feed.selected_section -= 1;
             self.feed.selected_item = 0;
@@ -433,64 +465,136 @@ impl MusicPlayerApp {
             .cloned()
     }
 
-    // -----------------------------------------------------------------------
-    // Feed play / import actions (Phase 3)
-    // -----------------------------------------------------------------------
+    /// Returns a reference to the currently highlighted `FeedPlaylist`, if any.
+    /// Used by the render path to avoid cloning.
+    pub(crate) fn feed_selected_item_ref(&self) -> Option<&crate::ui::state::FeedPlaylist> {
+        self.feed
+            .sections
+            .get(self.feed.selected_section)?
+            .items
+            .get(self.feed.selected_item)
+    }
 
-    /// Play the selected feed playlist immediately.
-    ///
-    /// Fetches the playlist tracks via yt-dlp, clears the current queue,
-    /// adds all tracks, starts playback of the first one, and returns to
-    /// Normal mode so the player bar is visible.
-    pub(super) async fn feed_play_now(&mut self) {
+    /// Expand the selected playlist to show individual tracks.
+    /// Switches focus to the Tracks pane once loaded.
+    pub(super) async fn feed_expand_playlist(&mut self) {
+        use crate::ui::state::FeedFocus;
+
+        // If already in track view, Enter on a track = play that track
+        if self.feed.focus == FeedFocus::Tracks {
+            self.feed_play_selected_track().await;
+            return;
+        }
+
         let Some(item) = self.feed_selected_item() else {
             return;
         };
 
-        self.status_message = format!("⏳ Loading '{}'…", item.title);
-        // Yield so the status message renders before the blocking fetch.
-        tokio::task::yield_now().await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        self.feed.tracks_loading = true;
+        self.feed.expanded_tracks.clear();
+        self.feed.selected_track = 0;
+        self.status_message = format!("Loading tracks from '{}'…", item.title);
 
-        let tracks = match self.feed_load_tracks(&item.url, &item.title).await {
-            Ok(t) => t,
-            Err(msg) => {
-                self.status_message = msg;
-                return;
+        tokio::task::yield_now().await;
+
+        let cookie = self.cookie_config();
+        let url = item.url.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            crate::services::feed::fetch_tracks_for_playlist(cookie, &url)
+                .map_err(|e| e.user_message())
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("Task error: {e}")));
+
+        self.feed.tracks_loading = false;
+
+        match result {
+            Ok(tracks) if tracks.is_empty() => {
+                self.status_message = format!("No tracks found in '{}'", item.title);
             }
+            Ok(tracks) => {
+                let count = tracks.len();
+                self.feed.expanded_tracks = tracks;
+                self.feed.focus = FeedFocus::Tracks;
+                self.status_message = format!(
+                    "{} tracks — j/k navigate, Enter play, a add, h/l back",
+                    count
+                );
+            }
+            Err(e) => {
+                self.status_message = e;
+            }
+        }
+    }
+
+    /// Play the currently highlighted track in the expanded track list.
+    async fn feed_play_selected_track(&mut self) {
+        let Some(track) = self.feed.expanded_tracks.get(self.feed.selected_track).cloned() else {
+            return;
         };
 
-        // Clear queue and load fresh tracks
+        let queue_track = crate::player::queue::Track::new(
+            track.video_id.clone(),
+            track.title.clone(),
+            track.duration,
+            track.uploader.clone(),
+            track.url.clone(),
+        );
+
         self.queue = crate::player::queue::Queue::new();
-        let (added, filtered) = self.add_filtered_tracks(&tracks);
-
-        if added == 0 {
-            self.status_message = format!("No playable tracks found in '{}'", item.title);
-            return;
-        }
-
-        // Mark as imported and close the feed browser
-        self.feed.imported_ids.insert(item.id.clone());
-        self.mode = AppMode::Normal;
-
-        // Trigger smart pre-downloads then start playing
+        self.queue.add(queue_track);
         self.trigger_smart_downloads();
         self.play_current_or_first().await;
 
-        if filtered > 0 {
-            self.status_message = format!(
-                "▶ Playing '{}' — {} tracks ({} filtered, Shift+F to allow all)",
-                item.title, added, filtered
-            );
-        } else {
-            self.status_message = format!("▶ Playing '{}' — {} tracks", item.title, added);
+        // Mark parent playlist as imported
+        if let Some(item) = self.feed_selected_item() {
+            self.feed.imported_ids.insert(item.id.clone());
         }
 
-        // Persist the new queue
+        self.feed.focus = crate::ui::state::FeedFocus::Playlists;
+        self.mode = AppMode::Normal;
+        self.status_message = format!("▶ Playing '{}'", track.title);
+    }
+
+    /// Add the currently highlighted track (in track view) to the queue.
+    pub(super) fn feed_add_selected_track(&mut self) {
+        let Some(track) = self.feed.expanded_tracks.get(self.feed.selected_track).cloned() else {
+            return;
+        };
+
+        let queue_track = crate::player::queue::Track::new(
+            track.video_id.clone(),
+            track.title.clone(),
+            track.duration,
+            track.uploader.clone(),
+            track.url.clone(),
+        );
+
+        let was_empty = self.queue.is_empty();
+        self.spawn_download_with_limit(&queue_track);
+        self.queue.add(queue_track);
+
+        // Mark parent playlist as (partially) imported
+        if let Some(item) = self.feed_selected_item() {
+            self.feed.imported_ids.insert(item.id.clone());
+        }
+
+        self.status_message = format!(
+            "✓ Added '{}' — {} in queue{}",
+            track.title,
+            self.queue.len(),
+            if was_empty { " — press Space to play" } else { "" }
+        );
+
         if let Err(e) = self.save_queue() {
-            self.status_message = format!("Playing, but queue not saved: {e}");
+            self.status_message = format!("Added, but queue not saved: {e}");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Feed play / import actions
+    // -----------------------------------------------------------------------
 
     /// Add the selected feed playlist to the existing queue without clearing it.
     ///
@@ -606,35 +710,93 @@ impl MusicPlayerApp {
         self.status_message = "Detecting YouTube accounts from browsers...".to_string();
 
         // Detect available accounts from Chrome/Firefox/Zen
-        self.available_accounts = self.browser_auth.detect_accounts();
+        let detected = self.browser_auth.detect_accounts();
 
-        if self.available_accounts.is_empty() {
+        if detected.is_empty() {
             self.status_message =
                 "No browser accounts found. Please login to YouTube in Chrome or Firefox first."
                     .to_string();
         } else {
+            // Prepend a Log out sentinel so it's always index 0.
+            self.available_accounts = Self::build_account_list(detected);
             self.status_message = format!(
                 "Found {} account(s). Select one:",
-                self.available_accounts.len()
+                self.available_accounts.len().saturating_sub(1) // exclude logout entry
             );
             self.ui.selected_account_idx = 0;
             self.mode = AppMode::AccountPicker;
         }
     }
 
+    /// Open the account picker from Normal mode (switch account or log out).
+    /// Works even when already authenticated — no need to be on the login screen.
+    pub(super) async fn switch_account(&mut self) {
+        self.status_message = "Detecting YouTube accounts from browsers...".to_string();
+
+        let detected = self.browser_auth.detect_accounts();
+
+        if detected.is_empty() {
+            self.status_message =
+                "No browser accounts found. Please login to YouTube in Chrome or Firefox first."
+                    .to_string();
+            return;
+        }
+
+        self.available_accounts = Self::build_account_list(detected);
+        self.ui.selected_account_idx = 0;
+        self.status_message = "Select an account or choose Log out".to_string();
+        self.mode = AppMode::AccountPicker;
+    }
+
+    /// Build the account list shown in the picker.
+    /// Always prepends a `[Log out]` sentinel at index 0.
+    fn build_account_list(
+        detected: Vec<crate::youtube::browser_auth::BrowserAccount>,
+    ) -> Vec<crate::youtube::browser_auth::BrowserAccount> {
+        use crate::youtube::browser_auth::BrowserAccount;
+        let mut list = vec![BrowserAccount {
+            browser: "logout".to_string(),
+            profile: String::new(),
+            email: None,
+            display_name: "[ Log out ]".to_string(),
+        }];
+        list.extend(detected);
+        list
+    }
+
     pub(super) async fn select_account(&mut self) {
-        if let Some(account) = self.available_accounts.get(self.ui.selected_account_idx) {
-            match self.browser_auth.save_selected_account(account) {
-                Ok(_) => {
-                    self.status_message = format!(
-                        "✓ Logged in as {} - Press '/' to search for music!",
-                        account.display_name
-                    );
-                    self.mode = AppMode::Normal;
-                }
-                Err(e) => {
-                    self.status_message = format!("Failed to save account: {}", e);
-                }
+        let Some(account) = self.available_accounts.get(self.ui.selected_account_idx).cloned()
+        else {
+            return;
+        };
+
+        // Logout sentinel
+        if account.browser == "logout" {
+            self.browser_auth.clear_selected_account();
+            // Clear the feed cache so stale data from the old account isn't shown
+            self.feed.sections.clear();
+            self.feed.imported_ids.clear();
+            self.feed.last_error = None;
+            self.available_accounts.clear();
+            self.mode = AppMode::LoginPrompt;
+            self.status_message = "Logged out. Press 'l' to select a new account.".to_string();
+            return;
+        }
+
+        match self.browser_auth.save_selected_account(&account) {
+            Ok(_) => {
+                self.status_message = format!(
+                    "✓ Logged in as {} — Press 'f' for your feed or '/' to search",
+                    account.display_name
+                );
+                // Clear any stale feed from a previous account
+                self.feed.sections.clear();
+                self.feed.imported_ids.clear();
+                self.feed.last_error = None;
+                self.mode = AppMode::Normal;
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to save account: {}", e);
             }
         }
     }

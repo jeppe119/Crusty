@@ -47,6 +47,8 @@ pub(crate) enum AppCommand {
     PreviousAccount,
     SelectAccount,
     CancelAccountPicker,
+    /// Open the account picker from Normal mode (switch account / log out).
+    SwitchAccount,
 
     // Search input
     SearchChar(char),
@@ -153,6 +155,7 @@ pub(crate) fn key_to_command(key: KeyEvent, ctx: &InputContext<'_>) -> Option<Ap
             KeyCode::Char('f') if has_shift => Some(AppCommand::ToggleMusicOnlyMode),
             KeyCode::Char('F') => Some(AppCommand::ToggleMusicOnlyMode),
             KeyCode::Char('f') => Some(AppCommand::OpenFeedBrowser),
+            KeyCode::Char('o') | KeyCode::Char('O') => Some(AppCommand::SwitchAccount),
             KeyCode::Char('d') | KeyCode::Char('D') => Some(AppCommand::Delete),
             KeyCode::Char('c') | KeyCode::Char('C') if has_shift && ctx.history_expanded => {
                 Some(AppCommand::ClearHistory)

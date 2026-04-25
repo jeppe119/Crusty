@@ -55,63 +55,45 @@ impl FeedError {
 // Public fetch functions
 // ---------------------------------------------------------------------------
 
-/// Fetch the YouTube Music home feed.
+/// Fetch the user's "Liked Music" playlist from YouTube Music (`list=LM`).
 ///
-/// Returns sections for Mixes, Recommended playlists, and Listen Again entries
-/// found on `https://music.youtube.com`.
-pub(crate) fn fetch_home(
-    cookie_config: Option<(bool, String)>,
-) -> Result<Vec<FeedSection>, FeedError> {
-    let cookie_config = cookie_config.ok_or(FeedError::NoCookies)?;
-    let stdout = run_yt_dlp(&["https://music.youtube.com"], &cookie_config)?;
-    let entries = parse_entries(&stdout);
-    Ok(group_into_sections(entries))
-}
-
-/// Fetch the user's saved/imported playlists from their YouTube Music library.
+/// Also extracts the user's YouTube channel ID from the response metadata,
+/// which is used by [`fetch_user_playlists`] to find their saved playlists.
 ///
-/// Returns a single [`FeedSection`] with `kind = PlaylistType::LibrarySaved`.
-pub(crate) fn fetch_library(
-    cookie_config: Option<(bool, String)>,
-) -> Result<FeedSection, FeedError> {
-    let cookie_config = cookie_config.ok_or(FeedError::NoCookies)?;
-    let stdout = run_yt_dlp(
-        &["https://music.youtube.com/library/playlists"],
-        &cookie_config,
-    )?;
-    let entries = parse_entries(&stdout)
-        .into_iter()
-        .filter(|p| {
-            matches!(
-                p.playlist_type,
-                PlaylistType::LibrarySaved | PlaylistType::Unknown
-            )
-        })
-        .collect();
-
-    Ok(FeedSection {
-        title: "Library".to_string(),
-        kind: PlaylistType::LibrarySaved,
-        items: entries,
-    })
-}
-
-/// Fetch the user's "Liked Music" auto-playlist.
-///
-/// Returns a single [`FeedSection`] containing one entry for the liked-songs
-/// playlist (`list=LM`).
+/// Returns a `(FeedSection, Option<channel_id>)` tuple.
 pub(crate) fn fetch_liked(
     cookie_config: Option<(bool, String)>,
-) -> Result<FeedSection, FeedError> {
+) -> Result<(FeedSection, Option<String>), FeedError> {
     let cookie_config = cookie_config.ok_or(FeedError::NoCookies)?;
     let stdout = run_yt_dlp(
         &["https://music.youtube.com/playlist?list=LM"],
         &cookie_config,
     )?;
 
-    // The liked-music playlist returns individual tracks, not a playlist entry.
-    // We synthesise a single FeedPlaylist entry representing the whole list.
-    let track_count = stdout.lines().filter(|l| !l.trim().is_empty()).count();
+    if stdout.trim().is_empty() {
+        return Err(FeedError::AuthExpired);
+    }
+
+    // Parse individual track lines to count tracks and extract channel ID.
+    let mut track_count = 0usize;
+    let mut channel_id: Option<String> = None;
+
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            track_count += 1;
+            // The channel_id in the playlist metadata is the *owner's* channel.
+            if channel_id.is_none() {
+                if let Some(cid) = json["playlist_channel_id"].as_str() {
+                    if !cid.is_empty() {
+                        channel_id = Some(cid.to_string());
+                    }
+                }
+            }
+        }
+    }
 
     let entry = FeedPlaylist {
         id: "LM".to_string(),
@@ -120,66 +102,160 @@ pub(crate) fn fetch_liked(
         playlist_type: PlaylistType::LibraryLiked,
         track_count_estimate: track_count,
         thumbnail_url: None,
-        description: Some("Your liked songs".to_string()),
+        description: Some(format!("{track_count} liked songs")),
     };
 
+    Ok((
+        FeedSection {
+            title: "Liked Music".to_string(),
+            kind: PlaylistType::LibraryLiked,
+            items: vec![entry],
+        },
+        channel_id,
+    ))
+}
+
+/// Fetch the user's own public playlists via their YouTube channel page.
+///
+/// Uses the channel ID extracted from [`fetch_liked`]. Returns a
+/// `LibrarySaved` section containing all playlists the user has created
+/// or saved on their channel.
+pub(crate) fn fetch_user_playlists(
+    cookie_config: Option<(bool, String)>,
+    channel_id: &str,
+) -> Result<FeedSection, FeedError> {
+    if !is_safe_playlist_id(channel_id) && !channel_id.starts_with("UC") {
+        return Err(FeedError::YtDlpFailed("Invalid channel ID".into()));
+    }
+
+    let cookie_config = cookie_config.ok_or(FeedError::NoCookies)?;
+    let url = format!(
+        "https://www.youtube.com/channel/{channel_id}/playlists?view=1&sort=dd"
+    );
+    let stdout = run_yt_dlp(&[url.as_str()], &cookie_config)?;
+
+    if stdout.trim().is_empty() {
+        return Err(FeedError::YtDlpFailed("No playlists found on channel".into()));
+    }
+
+    let entries = parse_entries(&stdout)
+        .into_iter()
+        .filter(|p| matches!(p.playlist_type, PlaylistType::LibrarySaved | PlaylistType::Unknown))
+        .collect::<Vec<_>>();
+
     Ok(FeedSection {
-        title: "Liked Music".to_string(),
-        kind: PlaylistType::LibraryLiked,
-        items: vec![entry],
+        title: "My Playlists".to_string(),
+        kind: PlaylistType::LibrarySaved,
+        items: entries,
     })
 }
 
-/// Fetch all three feed sources in parallel and merge into a single section list.
+/// Fetch all available feed sources in parallel and merge into a single list.
 ///
-/// Runs `fetch_home`, `fetch_library`, and `fetch_liked` concurrently using
-/// three `spawn_blocking` tasks. Partial success is tolerated — if library or
-/// liked-music fetches fail they are silently omitted so the home feed still
-/// renders. Only a total failure (home fetch fails) returns an `Err`.
+/// **What yt-dlp actually supports (as of 2026):**
+/// - `playlist?list=LM` — Liked Music ✅ (requires cookies)
+/// - `channel/{id}/playlists` — user's own playlists ✅ (requires cookies)
+/// - `music.youtube.com/feed/music` — personalised home feed ❌ (not supported by yt-dlp)
+/// - `music.youtube.com/library/playlists` — library ❌ (404s even with cookies)
 ///
-/// The returned `Vec<FeedSection>` is ordered: home sections first, then
-/// Library, then Liked Music (if available).
+/// Strategy: fetch Liked Music first (mandatory, also gives us the channel ID),
+/// then fetch the user's playlists in parallel. Partial success is tolerated.
 pub(crate) fn fetch_all_parallel(
     cookie_config: Option<(bool, String)>,
 ) -> Result<Vec<FeedSection>, FeedError> {
-    // Require cookies up-front — all three fetches need them.
     let cookie_config = cookie_config.ok_or(FeedError::NoCookies)?;
 
-    // Clone the cookie config for each of the three tasks.
-    let c1 = cookie_config.clone();
-    let c2 = cookie_config.clone();
-    let c3 = cookie_config;
+    // Step 1: fetch liked music — mandatory, also extracts channel ID.
+    let (liked_section, channel_id) = fetch_liked(Some(cookie_config.clone()))?;
 
-    // Run all three fetches on OS threads so they don't block each other.
-    // std::thread::scope gives us easy parallel execution without async.
-    let (home_result, lib_result, liked_result) = std::thread::scope(|s| {
-        let home_handle = s.spawn(move || fetch_home(Some(c1)));
-        let lib_handle = s.spawn(move || fetch_library(Some(c2)));
-        let liked_handle = s.spawn(move || fetch_liked(Some(c3)));
+    // Step 2: fetch user playlists in background if we have a channel ID.
+    let playlists_result: Option<Result<FeedSection, FeedError>> =
+        channel_id.as_deref().map(|cid| {
+            fetch_user_playlists(Some(cookie_config.clone()), cid)
+        });
 
-        let home = home_handle.join().unwrap_or_else(|_| Err(FeedError::YtDlpFailed("home thread panicked".into())));
-        let lib = lib_handle.join().unwrap_or_else(|_| Err(FeedError::YtDlpFailed("library thread panicked".into())));
-        let liked = liked_handle.join().unwrap_or_else(|_| Err(FeedError::YtDlpFailed("liked thread panicked".into())));
+    let mut sections = Vec::new();
 
-        (home, lib, liked)
-    });
-
-    // Home is mandatory — propagate its error.
-    let mut sections = home_result?;
-
-    // Library and Liked are optional — append if successful, skip silently on error.
-    if let Ok(lib_section) = lib_result {
-        if !lib_section.items.is_empty() {
-            sections.push(lib_section);
+    // User playlists first (most useful for navigation)
+    if let Some(Ok(playlists)) = playlists_result {
+        if !playlists.items.is_empty() {
+            sections.push(playlists);
         }
     }
-    if let Ok(liked_section) = liked_result {
-        if !liked_section.items.is_empty() {
-            sections.push(liked_section);
-        }
+
+    // Liked music always last
+    if !liked_section.items.is_empty() {
+        sections.push(liked_section);
+    }
+
+    if sections.is_empty() {
+        return Err(FeedError::YtDlpFailed(
+            "No playlists found. Make sure you are logged into YouTube in your browser.".into(),
+        ));
     }
 
     Ok(sections)
+}
+
+/// Fetch the individual tracks of any playlist URL and return them as
+/// `Vec<FeedTrack>` for display in the feed browser's track pane.
+///
+/// This is used when the user expands a playlist to cherry-pick tracks.
+pub(crate) fn fetch_tracks_for_playlist(
+    cookie_config: Option<(bool, String)>,
+    url: &str,
+) -> Result<Vec<crate::ui::state::FeedTrack>, FeedError> {
+    let cookie_config = cookie_config.ok_or(FeedError::NoCookies)?;
+    let stdout = run_yt_dlp(&[url], &cookie_config)?;
+
+    if stdout.trim().is_empty() {
+        return Err(FeedError::AuthExpired);
+    }
+
+    let mut tracks = Vec::new();
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        let video_id = json["id"].as_str().unwrap_or("").to_string();
+        if video_id.is_empty() {
+            continue;
+        }
+
+        let title = sanitize_text(
+            json["title"].as_str().unwrap_or("Unknown"),
+        );
+        let uploader = sanitize_text(
+            json["uploader"]
+                .as_str()
+                .or_else(|| json["channel"].as_str())
+                .unwrap_or("Unknown"),
+        );
+        let duration = json["duration"].as_u64().unwrap_or(0);
+
+        // Prefer music.youtube.com URL if available
+        let url = json["url"]
+            .as_str()
+            .or_else(|| json["webpage_url"].as_str())
+            .map(sanitize_text)
+            .unwrap_or_else(|| {
+                format!("https://music.youtube.com/watch?v={video_id}")
+            });
+
+        tracks.push(crate::ui::state::FeedTrack {
+            video_id,
+            title,
+            uploader,
+            duration,
+            url,
+        });
+    }
+
+    Ok(tracks)
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +462,7 @@ pub(crate) fn classify(id: &str, title: &str) -> PlaylistType {
 }
 
 /// Group a flat list of [`FeedPlaylist`] entries into labelled [`FeedSection`]s.
+#[allow(dead_code)]
 fn group_into_sections(entries: Vec<FeedPlaylist>) -> Vec<FeedSection> {
     let mut mixes: Vec<FeedPlaylist> = Vec::new();
     let mut recommended: Vec<FeedPlaylist> = Vec::new();

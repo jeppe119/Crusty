@@ -101,6 +101,26 @@ impl FeedSection {
     pub(crate) const CACHE_SCHEMA_VERSION: u32 = 1;
 }
 
+/// A single track inside an expanded feed playlist.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FeedTrack {
+    pub video_id: String,
+    pub title: String,
+    pub uploader: String,
+    pub duration: u64,
+    pub url: String,
+}
+
+/// Which pane is focused in the feed browser.
+#[derive(Debug, Default, PartialEq, Clone, Copy)]
+pub(crate) enum FeedFocus {
+    /// Navigating the playlist list (left/middle columns).
+    #[default]
+    Playlists,
+    /// Navigating the expanded track list of the selected playlist.
+    Tracks,
+}
+
 /// Runtime state for the feed browser view.
 #[derive(Debug, Default)]
 pub(crate) struct FeedState {
@@ -110,15 +130,22 @@ pub(crate) struct FeedState {
     pub selected_section: usize,
     /// Index of the currently highlighted item within the selected section.
     pub selected_item: usize,
-    /// `true` while an async fetch is in progress.
+    /// `true` while an async feed fetch is in progress.
     pub is_loading: bool,
+    /// `true` while tracks for the selected playlist are being fetched.
+    pub tracks_loading: bool,
     /// When the feed was last successfully fetched.
     pub last_fetch: Option<std::time::Instant>,
     /// Last error message to display in the feed browser.
     pub last_error: Option<String>,
-    /// IDs of playlists that have been imported into the playlist manager
-    /// during this session (used to render a ✓ marker).
+    /// IDs of playlists that have been imported (whole or partially) this session.
     pub imported_ids: std::collections::HashSet<String>,
+    /// Tracks expanded from the currently selected playlist.
+    pub expanded_tracks: Vec<FeedTrack>,
+    /// Which track is highlighted in the expanded track list.
+    pub selected_track: usize,
+    /// Which pane has keyboard focus.
+    pub focus: FeedFocus,
 }
 
 /// Serializable snapshot of the queue for persistence.

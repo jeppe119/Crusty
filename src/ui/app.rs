@@ -734,7 +734,15 @@ impl MusicPlayerApp {
             AppCommand::NextAccount => self.next_account(),
             AppCommand::PreviousAccount => self.prev_account(),
             AppCommand::SelectAccount => self.select_account().await,
-            AppCommand::CancelAccountPicker => self.mode = AppMode::LoginPrompt,
+            AppCommand::CancelAccountPicker => {
+                // Return to Normal if already authenticated, LoginPrompt if not.
+                self.mode = if self.browser_auth.is_authenticated() {
+                    AppMode::Normal
+                } else {
+                    AppMode::LoginPrompt
+                };
+            }
+            AppCommand::SwitchAccount => self.switch_account().await,
 
             // Search input
             AppCommand::SearchChar(c) => self.search.query.push(c),
@@ -786,8 +794,24 @@ impl MusicPlayerApp {
             AppCommand::FeedNavigateUp => self.feed_navigate_up(),
             AppCommand::FeedNextSection => self.feed_next_section(),
             AppCommand::FeedPrevSection => self.feed_prev_section(),
-            AppCommand::FeedPlayNow => self.feed_play_now().await,
-            AppCommand::FeedAddToPlaylist => self.feed_add_to_playlist().await,
+            AppCommand::FeedPlayNow => {
+                use crate::ui::state::FeedFocus;
+                if self.feed.focus == FeedFocus::Tracks {
+                    // Enter on a track = play that single track
+                    self.feed_expand_playlist().await; // delegates to feed_play_selected_track
+                } else {
+                    // Enter on a playlist = expand to show tracks
+                    self.feed_expand_playlist().await;
+                }
+            }
+            AppCommand::FeedAddToPlaylist => {
+                use crate::ui::state::FeedFocus;
+                if self.feed.focus == FeedFocus::Tracks {
+                    self.feed_add_selected_track();
+                } else {
+                    self.feed_add_to_playlist().await;
+                }
+            }
         }
     }
 
