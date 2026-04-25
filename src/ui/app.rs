@@ -493,6 +493,9 @@ impl MusicPlayerApp {
                 AppMode::LoginPrompt => "Login Required".to_string(),
                 AppMode::AccountPicker => "Select YouTube Account".to_string(),
                 AppMode::Help => "Help - Press '?', 'Esc', or 'q' to close".to_string(),
+                AppMode::FeedBrowser => {
+                    "Feed Browser - [j/k] Navigate  [h/l] Sections  [Enter] Play  [a] Add  [r] Refresh  [Esc/f] Close".to_string()
+                }
             }
         };
         let header = Paragraph::new(title).block(
@@ -732,6 +735,38 @@ impl MusicPlayerApp {
                 self.playlist.url.clear();
                 self.ui.playlist_loading_expanded = false;
                 self.status_message = "Cancelled playlist loading".to_string();
+            }
+
+            // Feed browser commands (Phase 2 will implement full handlers)
+            AppCommand::OpenFeedBrowser => {
+                self.mode = AppMode::FeedBrowser;
+            }
+            AppCommand::CloseFeedBrowser => {
+                self.mode = AppMode::Normal;
+            }
+            AppCommand::RefreshFeed => {
+                // Full async implementation in Phase 2
+                self.status_message = "Feed refresh coming soon".to_string();
+            }
+            AppCommand::FeedNavigateDown => {
+                // Full implementation in Phase 2
+            }
+            AppCommand::FeedNavigateUp => {
+                // Full implementation in Phase 2
+            }
+            AppCommand::FeedNextSection => {
+                // Full implementation in Phase 2
+            }
+            AppCommand::FeedPrevSection => {
+                // Full implementation in Phase 2
+            }
+            AppCommand::FeedPlayNow => {
+                // Full implementation in Phase 3
+                self.status_message = "Feed play coming soon".to_string();
+            }
+            AppCommand::FeedAddToPlaylist => {
+                // Full implementation in Phase 3
+                self.status_message = "Feed import coming soon".to_string();
             }
         }
     }

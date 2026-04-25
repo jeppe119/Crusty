@@ -13,6 +13,8 @@ pub(crate) enum AppMode {
     AccountPicker,
     Help,
     LoadingPlaylist,
+    /// The YouTube Music feed browser is open.
+    FeedBrowser,
 }
 
 /// Which top-level view is currently displayed.
@@ -29,6 +31,89 @@ pub(crate) struct MixPlaylist {
     pub title: String,
     pub track_count: usize,
     pub url: String,
+}
+
+// ---------------------------------------------------------------------------
+// Feed browser types (Phase 2 will wire these to the UI)
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+/// The category of a YouTube Music playlist entry in the feed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum PlaylistType {
+    /// Auto-generated "My Mix" playlists (`RDCLAK*`, `RDAMPL*`).
+    Mix,
+    /// Algorithmically recommended playlists (`OLAK5uy_*`).
+    Recommended,
+    /// "Listen Again" re-recommendation entries.
+    ListenAgain,
+    /// User-saved or imported playlists (`PL*`, `VL*`).
+    LibrarySaved,
+    /// The "Liked Music" auto-playlist (`LM`).
+    LibraryLiked,
+    /// Unrecognised playlist type.
+    Unknown,
+}
+
+impl std::fmt::Display for PlaylistType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            PlaylistType::Mix => "Mix",
+            PlaylistType::Recommended => "Recommended",
+            PlaylistType::ListenAgain => "Listen Again",
+            PlaylistType::LibrarySaved => "Library",
+            PlaylistType::LibraryLiked => "Liked",
+            PlaylistType::Unknown => "Playlist",
+        };
+        write!(f, "{label}")
+    }
+}
+
+/// A single playlist entry in the YouTube Music feed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FeedPlaylist {
+    /// Playlist ID (e.g. `RDCLAK5uy_…`, `OLAK5uy_…`, `PL…`, `LM`).
+    pub id: String,
+    pub title: String,
+    /// Canonical `music.youtube.com/playlist?list=…` URL.
+    pub url: String,
+    pub playlist_type: PlaylistType,
+    /// Approximate track count; `0` if unknown.
+    pub track_count_estimate: usize,
+    pub thumbnail_url: Option<String>,
+    /// Subtitle, channel name, or description from yt-dlp.
+    pub description: Option<String>,
+}
+
+/// A labelled group of [`FeedPlaylist`] entries (e.g. "My Mixes").
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FeedSection {
+    /// Human-readable section title shown in the feed browser.
+    pub title: String,
+    /// The dominant playlist type for this section.
+    pub kind: PlaylistType,
+    pub items: Vec<FeedPlaylist>,
+}
+
+/// Runtime state for the feed browser view.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub(crate) struct FeedState {
+    /// Fetched sections (Mixes, Recommended, Library, …).
+    pub sections: Vec<FeedSection>,
+    /// Index of the currently highlighted section in the sidebar.
+    pub selected_section: usize,
+    /// Index of the currently highlighted item within the selected section.
+    pub selected_item: usize,
+    /// `true` while an async fetch is in progress.
+    pub is_loading: bool,
+    /// When the feed was last successfully fetched.
+    pub last_fetch: Option<std::time::Instant>,
+    /// Last error message to display in the feed browser.
+    pub last_error: Option<String>,
+    /// IDs of playlists that have been imported into the playlist manager
+    /// during this session (used to render a ✓ marker).
+    pub imported_ids: std::collections::HashSet<String>,
 }
 
 /// Serializable snapshot of the queue for persistence.

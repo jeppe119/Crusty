@@ -39,8 +39,10 @@ regex = "1.10"
 
 # No longer needed - we use browser cookies instead of OAuth
 
-[dev-dependencies]
+# Atomic file writes (write to temp, then rename — prevents torn files on crash)
 tempfile = "3.10"
+
+[dev-dependencies]
 
 [profile.release]
 opt-level = 3

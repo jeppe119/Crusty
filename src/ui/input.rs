@@ -59,6 +59,18 @@ pub(crate) enum AppCommand {
     PlaylistBackspace,
     PlaylistSubmit,
     PlaylistCancel,
+
+    // Feed browser (Phase 2 will wire OpenFeedBrowser to the 'f' key in Normal mode)
+    #[allow(dead_code)]
+    OpenFeedBrowser,
+    CloseFeedBrowser,
+    RefreshFeed,
+    FeedNavigateDown,
+    FeedNavigateUp,
+    FeedNextSection,
+    FeedPrevSection,
+    FeedPlayNow,
+    FeedAddToPlaylist,
 }
 
 /// Snapshot of relevant UI state for key mapping decisions.
@@ -109,6 +121,19 @@ pub(crate) fn key_to_command(key: KeyEvent, ctx: &InputContext<'_>) -> Option<Ap
         },
         AppMode::Help => match key.code {
             KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => Some(AppCommand::DismissHelp),
+            _ => None,
+        },
+        AppMode::FeedBrowser => match key.code {
+            KeyCode::Char('q') => Some(AppCommand::Quit),
+            KeyCode::Char('?') => Some(AppCommand::ShowHelp),
+            KeyCode::Char('f') | KeyCode::Esc => Some(AppCommand::CloseFeedBrowser),
+            KeyCode::Char('r') | KeyCode::Char('R') => Some(AppCommand::RefreshFeed),
+            KeyCode::Char('j') | KeyCode::Down => Some(AppCommand::FeedNavigateDown),
+            KeyCode::Char('k') | KeyCode::Up => Some(AppCommand::FeedNavigateUp),
+            KeyCode::Char('l') | KeyCode::Right => Some(AppCommand::FeedNextSection),
+            KeyCode::Char('h') | KeyCode::Left => Some(AppCommand::FeedPrevSection),
+            KeyCode::Enter => Some(AppCommand::FeedPlayNow),
+            KeyCode::Char('a') | KeyCode::Char('A') => Some(AppCommand::FeedAddToPlaylist),
             _ => None,
         },
         AppMode::Normal => match key.code {

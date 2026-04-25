@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -12,13 +12,53 @@ use crate::player::queue::Track;
 use crate::ui::state::QueueState;
 
 /// Maximum file size in bytes (10 MB).
-const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+pub(crate) const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Maximum number of entries allowed in a persisted collection.
 const MAX_ENTRY_COUNT: usize = 10_000;
 
 /// Maximum number of history entries to persist.
 pub(crate) const MAX_HISTORY_SIZE: usize = 100;
+
+// ---------------------------------------------------------------------------
+// Atomic write helper
+// ---------------------------------------------------------------------------
+
+/// Atomically write `bytes` to `path` with 0o600 permissions on Unix.
+///
+/// Writes to a temporary file in the same directory, then renames it into
+/// place. On POSIX systems `rename(2)` is atomic within the same filesystem,
+/// so readers see either the old file or the new one — never a torn write.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().context("path has no parent directory")?;
+    fs::create_dir_all(dir).context("Failed to create config directory")?;
+
+    let mut tmp =
+        tempfile::NamedTempFile::new_in(dir).context("Failed to create temp file for atomic write")?;
+
+    tmp.write_all(bytes)
+        .context("Failed to write bytes to temp file")?;
+
+    // Best-effort fsync — ensures data reaches disk before the rename.
+    let _ = tmp.as_file().sync_all();
+
+    // Set 0o600 on the temp file *before* the rename so the final path
+    // never briefly has world-readable permissions.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o600));
+    }
+
+    tmp.persist(path)
+        .map_err(|e| anyhow::anyhow!("Failed to atomically replace {}: {}", path.display(), e))?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// PersistenceService
+// ---------------------------------------------------------------------------
 
 /// Handles reading and writing history/queue state to disk.
 pub(crate) struct PersistenceService {
@@ -74,8 +114,6 @@ impl PersistenceService {
     }
 
     pub(crate) fn save_history(&self, history: &[Track]) -> Result<()> {
-        fs::create_dir_all(&self.config_dir).context("Failed to create config directory")?;
-
         // Limit to most recent entries before serializing
         let to_save = if history.len() > MAX_HISTORY_SIZE {
             &history[history.len() - MAX_HISTORY_SIZE..]
@@ -85,16 +123,7 @@ impl PersistenceService {
 
         let path = self.config_dir.join("history.json");
         let json = serde_json::to_string_pretty(to_save).context("Failed to serialize history")?;
-        fs::write(&path, json).context("Failed to write history file")?;
-
-        // Restrict file permissions (owner read/write only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
-
-        Ok(())
+        write_atomic(&path, json.as_bytes()).context("Failed to write history file")
     }
 
     // -- Queue ----------------------------------------------------------
@@ -143,19 +172,9 @@ impl PersistenceService {
     }
 
     pub(crate) fn save_queue(&self, state: &QueueState) -> Result<()> {
-        fs::create_dir_all(&self.config_dir).context("Failed to create config directory")?;
-
         let path = self.config_dir.join("queue.json");
         let json = serde_json::to_string_pretty(state).context("Failed to serialize queue")?;
-        fs::write(&path, json).context("Failed to write queue file")?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
-
-        Ok(())
+        write_atomic(&path, json.as_bytes()).context("Failed to write queue file")
     }
 
     // -- Download cache -------------------------------------------------
@@ -195,38 +214,19 @@ impl PersistenceService {
 
     /// Save the download cache to disk.
     pub(crate) fn save_download_cache(&self, cache: &HashMap<String, String>) -> Result<()> {
-        fs::create_dir_all(&self.config_dir).context("Failed to create config directory")?;
-
         let path = self.config_dir.join("download_cache.json");
         let json = serde_json::to_string(cache).context("Failed to serialize download cache")?;
-        fs::write(&path, json).context("Failed to write download cache")?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
-
-        Ok(())
+        write_atomic(&path, json.as_bytes()).context("Failed to write download cache")
     }
 
     // -- Playback state (resume position) -----------------------------------
 
     /// Save the current playback position so it can be resumed on restart.
     pub(crate) fn save_playback_state(&self, state: &PlaybackState) -> Result<()> {
-        fs::create_dir_all(&self.config_dir).context("Failed to create config directory")?;
-
         let path = self.config_dir.join("playback_state.json");
-        let json = serde_json::to_string(state).context("Failed to serialize playback state")?;
-        fs::write(&path, json).context("Failed to write playback state")?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
-
-        Ok(())
+        let json =
+            serde_json::to_string(state).context("Failed to serialize playback state")?;
+        write_atomic(&path, json.as_bytes()).context("Failed to write playback state")
     }
 
     /// Load the saved playback state, if any.
@@ -279,7 +279,6 @@ pub(crate) fn search_history<'a>(history: &'a [Track], query: &str) -> Vec<&'a T
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use tempfile::TempDir;
 
     fn make_track(id: &str, title: &str, uploader: &str) -> Track {
@@ -294,6 +293,56 @@ mod tests {
 
     fn service_in(dir: &std::path::Path) -> PersistenceService {
         PersistenceService::from_dir(dir.to_path_buf())
+    }
+
+    // -- write_atomic tests --
+
+    #[test]
+    fn write_atomic_creates_file_with_correct_content() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.json");
+
+        write_atomic(&path, b"{\"key\":\"value\"}").unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "{\"key\":\"value\"}");
+    }
+
+    #[test]
+    fn write_atomic_overwrites_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.json");
+
+        write_atomic(&path, b"first").unwrap();
+        write_atomic(&path, b"second").unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "second");
+    }
+
+    #[test]
+    fn write_atomic_creates_parent_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("nested").join("dir").join("test.json");
+
+        write_atomic(&path, b"hello").unwrap();
+
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_sets_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("secret.json");
+
+        write_atomic(&path, b"secret").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        // Only owner read/write (0o600); mask off file-type bits
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     // -- History round-trip tests --
@@ -347,9 +396,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("history.json");
 
-        let mut f = fs::File::create(&path).unwrap();
+        // Write directly (bypassing write_atomic) to create an oversized file
         let big_content = "x".repeat(11 * 1024 * 1024);
-        f.write_all(big_content.as_bytes()).unwrap();
+        fs::write(&path, big_content).unwrap();
 
         let svc = service_in(tmp.path());
         let result = svc.load_history();
@@ -410,9 +459,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("queue.json");
 
-        let mut f = fs::File::create(&path).unwrap();
         let big_content = "x".repeat(11 * 1024 * 1024);
-        f.write_all(big_content.as_bytes()).unwrap();
+        fs::write(&path, big_content).unwrap();
 
         let svc = service_in(tmp.path());
         let result = svc.load_queue();
