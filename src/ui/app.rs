@@ -774,7 +774,7 @@ impl MusicPlayerApp {
             AppCommand::CloseFeedBrowser => {
                 self.mode = AppMode::Normal;
             }
-            AppCommand::RefreshFeed => self.refresh_feed().await,
+            AppCommand::RefreshFeed => self.refresh_feed(true).await,
             AppCommand::FeedNavigateDown => self.feed_navigate_down(),
             AppCommand::FeedNavigateUp => self.feed_navigate_up(),
             AppCommand::FeedNextSection => self.feed_next_section(),

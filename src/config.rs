@@ -28,6 +28,10 @@ pub(crate) const LOOKAHEAD_DOWNLOAD_COUNT: usize = 10;
 /// Number of tracks to pre-download on startup/queue restore.
 pub(crate) const STARTUP_DOWNLOAD_COUNT: usize = 5;
 
+/// How long (seconds) the on-disk feed cache is considered fresh.
+/// After this TTL the next `open_feed_browser` triggers a background re-fetch.
+pub(crate) const FEED_CACHE_TTL_SECS: u64 = 30 * 60; // 30 minutes
+
 /// Returns the application config directory path (e.g., `~/.config/youtube-music-player`).
 pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
     let dir = dirs::config_dir()

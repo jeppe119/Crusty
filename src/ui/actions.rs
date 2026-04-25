@@ -3,9 +3,12 @@
 //! Handles search, playlist loading, queue additions, account management,
 //! and the YouTube Music feed browser.
 
-use crate::config::{clean_title, is_allowed_youtube_url, MAX_TRACK_DURATION_SECS};
+use std::time::Duration;
+
+use crate::config::{clean_title, is_allowed_youtube_url, FEED_CACHE_TTL_SECS, MAX_TRACK_DURATION_SECS};
 use crate::player::queue::Track;
-use crate::ui::state::AppMode;
+use crate::services::cache_store::CacheStore;
+use crate::ui::state::{AppMode, FeedSection};
 use crate::youtube::extractor::YouTubeExtractor;
 
 use super::app::MusicPlayerApp;
@@ -270,23 +273,62 @@ impl MusicPlayerApp {
     // Feed browser actions
     // -----------------------------------------------------------------------
 
-    /// Open the feed browser. Triggers an async fetch on first open (or when
-    /// the feed is empty). Subsequent opens reuse the in-memory cache; the
-    /// user can press `r` to force a refresh.
+    /// Open the feed browser.
+    ///
+    /// - If the in-memory feed is already populated, just switches mode (instant).
+    /// - If the disk cache is fresh (< 30 min), loads it synchronously and
+    ///   switches mode without spawning yt-dlp.
+    /// - Otherwise triggers a background fetch via `refresh_feed(force: false)`.
     pub(super) async fn open_feed_browser(&mut self) {
         self.mode = AppMode::FeedBrowser;
         self.feed.selected_section = 0;
         self.feed.selected_item = 0;
 
-        // Auto-fetch on first open
-        if self.feed.sections.is_empty() && !self.feed.is_loading {
-            self.refresh_feed().await;
+        // Already have in-memory sections — nothing to do.
+        if !self.feed.sections.is_empty() {
+            return;
+        }
+
+        // Try the disk cache before spawning yt-dlp.
+        if self.try_load_feed_cache() {
+            return;
+        }
+
+        // Cache miss — fetch in background.
+        if !self.feed.is_loading {
+            self.refresh_feed(false).await;
         }
     }
 
-    /// Spawn an async yt-dlp fetch for the YouTube Music home feed.
-    /// Results are delivered via `feed_tx` and drained in the `run()` loop.
-    pub(super) async fn refresh_feed(&mut self) {
+    /// Try to load the feed from the on-disk `CacheStore`.
+    ///
+    /// Returns `true` and populates `feed.sections` if a fresh cache entry
+    /// exists. Returns `false` on miss (expired, missing, corrupt, schema
+    /// mismatch) without modifying state.
+    fn try_load_feed_cache(&mut self) -> bool {
+        let config_dir = match self.persistence.config_dir().to_owned().into_os_string().into_string() {
+            Ok(_) => self.persistence.config_dir().to_owned(),
+            Err(_) => return false,
+        };
+        let store = Self::feed_cache_store(config_dir);
+        match store.load() {
+            Ok(Some(sections)) => {
+                self.feed.sections = sections;
+                self.feed.last_fetch = Some(std::time::Instant::now());
+                self.feed.last_error = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Spawn an async parallel yt-dlp fetch for the full YouTube Music feed
+    /// (home + library + liked). Results are delivered via `feed_tx` and
+    /// drained in the `run()` loop, which also persists the result to disk.
+    ///
+    /// `force = true` is used when the user explicitly presses `r` — it
+    /// bypasses the TTL check and always re-fetches.
+    pub(super) async fn refresh_feed(&mut self, force: bool) {
         if self.cookie_config().is_none() {
             self.feed.last_error = Some(
                 "No browser account selected. Press 'q' then 'l' to log in.".to_string(),
@@ -295,23 +337,47 @@ impl MusicPlayerApp {
             return;
         }
 
+        // On a forced refresh, clear the disk cache so the next open_feed_browser
+        // doesn't serve stale data.
+        if force {
+            let store = Self::feed_cache_store(self.persistence.config_dir().to_owned());
+            store.invalidate();
+            self.feed.sections.clear();
+        }
+
         self.feed.is_loading = true;
         self.feed.last_error = None;
-        self.status_message = "Fetching YouTube Music feed…".to_string();
+        self.status_message = "Fetching YouTube Music feed (home + library + liked)…".to_string();
 
         let cookie = self.cookie_config();
+        let config_dir = self.persistence.config_dir().to_owned();
         let tx = self.feed_tx.clone();
 
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                crate::services::feed::fetch_home(cookie)
+                crate::services::feed::fetch_all_parallel(cookie)
                     .map_err(|e| e.user_message())
             })
             .await
             .unwrap_or_else(|e| Err(format!("Task error: {e}")));
 
+            // Persist a successful result to disk before sending to the UI.
+            if let Ok(ref sections) = result {
+                let store = MusicPlayerApp::feed_cache_store(config_dir);
+                let _ = store.save(sections);
+            }
+
             let _ = tx.send(result);
         });
+    }
+
+    /// Build the `CacheStore` for the feed, rooted at `config_dir`.
+    fn feed_cache_store(config_dir: std::path::PathBuf) -> CacheStore<Vec<FeedSection>> {
+        CacheStore::new(
+            config_dir.join("feed_cache.json"),
+            Duration::from_secs(FEED_CACHE_TTL_SECS),
+            1, // schema_version — bump if FeedSection/FeedPlaylist shape changes
+        )
     }
 
     // Feed navigation helpers

@@ -1,5 +1,4 @@
 //! YouTube Music feed scraping service.
-#![allow(dead_code)]
 //!
 //! Fetches personalised playlists from YouTube Music using the user's browser
 //! cookies (via yt-dlp). No OAuth or YouTube Data API is required — the same
@@ -129,6 +128,58 @@ pub(crate) fn fetch_liked(
         kind: PlaylistType::LibraryLiked,
         items: vec![entry],
     })
+}
+
+/// Fetch all three feed sources in parallel and merge into a single section list.
+///
+/// Runs `fetch_home`, `fetch_library`, and `fetch_liked` concurrently using
+/// three `spawn_blocking` tasks. Partial success is tolerated — if library or
+/// liked-music fetches fail they are silently omitted so the home feed still
+/// renders. Only a total failure (home fetch fails) returns an `Err`.
+///
+/// The returned `Vec<FeedSection>` is ordered: home sections first, then
+/// Library, then Liked Music (if available).
+pub(crate) fn fetch_all_parallel(
+    cookie_config: Option<(bool, String)>,
+) -> Result<Vec<FeedSection>, FeedError> {
+    // Require cookies up-front — all three fetches need them.
+    let cookie_config = cookie_config.ok_or(FeedError::NoCookies)?;
+
+    // Clone the cookie config for each of the three tasks.
+    let c1 = cookie_config.clone();
+    let c2 = cookie_config.clone();
+    let c3 = cookie_config;
+
+    // Run all three fetches on OS threads so they don't block each other.
+    // std::thread::scope gives us easy parallel execution without async.
+    let (home_result, lib_result, liked_result) = std::thread::scope(|s| {
+        let home_handle = s.spawn(move || fetch_home(Some(c1)));
+        let lib_handle = s.spawn(move || fetch_library(Some(c2)));
+        let liked_handle = s.spawn(move || fetch_liked(Some(c3)));
+
+        let home = home_handle.join().unwrap_or_else(|_| Err(FeedError::YtDlpFailed("home thread panicked".into())));
+        let lib = lib_handle.join().unwrap_or_else(|_| Err(FeedError::YtDlpFailed("library thread panicked".into())));
+        let liked = liked_handle.join().unwrap_or_else(|_| Err(FeedError::YtDlpFailed("liked thread panicked".into())));
+
+        (home, lib, liked)
+    });
+
+    // Home is mandatory — propagate its error.
+    let mut sections = home_result?;
+
+    // Library and Liked are optional — append if successful, skip silently on error.
+    if let Ok(lib_section) = lib_result {
+        if !lib_section.items.is_empty() {
+            sections.push(lib_section);
+        }
+    }
+    if let Ok(liked_section) = liked_result {
+        if !liked_section.items.is_empty() {
+            sections.push(liked_section);
+        }
+    }
+
+    Ok(sections)
 }
 
 // ---------------------------------------------------------------------------
@@ -568,5 +619,184 @@ mod tests {
         // Only "My Mixes" — no Recommended, Listen Again, or Other sections
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].title, "My Mixes");
+    }
+
+    // -- fetch_all_parallel merge logic --
+
+    /// Build a minimal FeedSection for testing merge behaviour.
+    fn make_section(title: &str, kind: PlaylistType, n_items: usize) -> FeedSection {
+        FeedSection {
+            title: title.to_string(),
+            kind,
+            items: (0..n_items)
+                .map(|i| FeedPlaylist {
+                    id: format!("{title}-{i}"),
+                    title: format!("Item {i}"),
+                    url: format!("https://music.youtube.com/playlist?list={title}-{i}"),
+                    playlist_type: kind,
+                    track_count_estimate: 5,
+                    thumbnail_url: None,
+                    description: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn merge_appends_non_empty_optional_sections() {
+        // Simulate what fetch_all_parallel does with its results.
+        let home = vec![
+            make_section("My Mixes", PlaylistType::Mix, 2),
+            make_section("Recommended", PlaylistType::Recommended, 1),
+        ];
+        let lib: Result<FeedSection, FeedError> =
+            Ok(make_section("Library", PlaylistType::LibrarySaved, 3));
+        let liked: Result<FeedSection, FeedError> =
+            Ok(make_section("Liked Music", PlaylistType::LibraryLiked, 1));
+
+        let mut sections = home;
+        if let Ok(s) = lib {
+            if !s.items.is_empty() {
+                sections.push(s);
+            }
+        }
+        if let Ok(s) = liked {
+            if !s.items.is_empty() {
+                sections.push(s);
+            }
+        }
+
+        assert_eq!(sections.len(), 4);
+        assert_eq!(sections[2].title, "Library");
+        assert_eq!(sections[3].title, "Liked Music");
+    }
+
+    #[test]
+    fn merge_skips_empty_optional_sections() {
+        let home = vec![make_section("My Mixes", PlaylistType::Mix, 2)];
+        // Library returns an empty section (e.g. user has no saved playlists)
+        let lib: Result<FeedSection, FeedError> =
+            Ok(make_section("Library", PlaylistType::LibrarySaved, 0));
+        let liked: Result<FeedSection, FeedError> =
+            Ok(make_section("Liked Music", PlaylistType::LibraryLiked, 1));
+
+        let mut sections = home;
+        if let Ok(s) = lib {
+            if !s.items.is_empty() {
+                sections.push(s);
+            }
+        }
+        if let Ok(s) = liked {
+            if !s.items.is_empty() {
+                sections.push(s);
+            }
+        }
+
+        // Library was empty — only home + liked
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[1].title, "Liked Music");
+    }
+
+    #[test]
+    fn merge_tolerates_optional_section_errors() {
+        let home = vec![make_section("My Mixes", PlaylistType::Mix, 2)];
+        let lib: Result<FeedSection, FeedError> =
+            Err(FeedError::YtDlpFailed("network error".into()));
+        let liked: Result<FeedSection, FeedError> =
+            Err(FeedError::AuthExpired);
+
+        let mut sections = home;
+        if let Ok(s) = lib {
+            if !s.items.is_empty() {
+                sections.push(s);
+            }
+        }
+        if let Ok(s) = liked {
+            if !s.items.is_empty() {
+                sections.push(s);
+            }
+        }
+
+        // Both optional fetches failed — only home sections remain
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].title, "My Mixes");
+    }
+
+    // -- CacheStore integration with FeedSection --
+
+    #[test]
+    fn feed_cache_round_trip() {
+        use crate::services::cache_store::CacheStore;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store: CacheStore<Vec<FeedSection>> = CacheStore::new(
+            tmp.path().join("feed_cache.json"),
+            Duration::from_secs(3600),
+            1,
+        );
+
+        let sections = vec![
+            make_section("My Mixes", PlaylistType::Mix, 2),
+            make_section("Library", PlaylistType::LibrarySaved, 1),
+        ];
+
+        store.save(&sections).unwrap();
+        let loaded = store.load().unwrap().unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].title, "My Mixes");
+        assert_eq!(loaded[0].items.len(), 2);
+        assert_eq!(loaded[1].title, "Library");
+    }
+
+    #[test]
+    fn feed_cache_expires_after_ttl() {
+        use crate::services::cache_store::CacheStore;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        // TTL of 0 — always expired
+        let store: CacheStore<Vec<FeedSection>> = CacheStore::new(
+            tmp.path().join("feed_cache.json"),
+            Duration::from_secs(0),
+            1,
+        );
+
+        store
+            .save(&vec![make_section("My Mixes", PlaylistType::Mix, 1)])
+            .unwrap();
+
+        // Should be a miss immediately
+        assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn feed_cache_schema_version_mismatch_is_miss() {
+        use crate::services::cache_store::CacheStore;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+
+        // Save with schema version 1
+        let store_v1: CacheStore<Vec<FeedSection>> = CacheStore::new(
+            tmp.path().join("feed_cache.json"),
+            Duration::from_secs(3600),
+            1,
+        );
+        store_v1
+            .save(&vec![make_section("My Mixes", PlaylistType::Mix, 1)])
+            .unwrap();
+
+        // Load with schema version 2 — should be a miss
+        let store_v2: CacheStore<Vec<FeedSection>> = CacheStore::new(
+            tmp.path().join("feed_cache.json"),
+            Duration::from_secs(3600),
+            2,
+        );
+        assert!(store_v2.load().unwrap().is_none());
     }
 }

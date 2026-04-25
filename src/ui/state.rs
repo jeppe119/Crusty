@@ -34,10 +34,9 @@ pub(crate) struct MixPlaylist {
 }
 
 // ---------------------------------------------------------------------------
-// Feed browser types (Phase 2 will wire these to the UI)
+// Feed browser types
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 /// The category of a YouTube Music playlist entry in the feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PlaylistType {
@@ -96,7 +95,6 @@ pub(crate) struct FeedSection {
 }
 
 /// Runtime state for the feed browser view.
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct FeedState {
     /// Fetched sections (Mixes, Recommended, Library, …).

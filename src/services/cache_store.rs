@@ -36,7 +36,6 @@ use super::persistence::{write_atomic, MAX_FILE_SIZE};
 // On-disk envelope
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedEnvelope<T> {
     /// Unix timestamp (seconds since UNIX_EPOCH) when the cache was written.
@@ -54,7 +53,6 @@ struct CachedEnvelope<T> {
 // ---------------------------------------------------------------------------
 
 /// A file-backed, TTL-aware cache for any `serde`-serializable type.
-#[allow(dead_code)]
 pub(crate) struct CacheStore<T> {
     path: PathBuf,
     ttl: Duration,
@@ -62,7 +60,6 @@ pub(crate) struct CacheStore<T> {
     _marker: std::marker::PhantomData<T>,
 }
 
-#[allow(dead_code)]
 impl<T: Serialize + DeserializeOwned> CacheStore<T> {
     /// Create a new `CacheStore`.
     ///

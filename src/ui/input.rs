@@ -60,8 +60,7 @@ pub(crate) enum AppCommand {
     PlaylistSubmit,
     PlaylistCancel,
 
-    // Feed browser (Phase 2 will wire OpenFeedBrowser to the 'f' key in Normal mode)
-    #[allow(dead_code)]
+    // Feed browser
     OpenFeedBrowser,
     CloseFeedBrowser,
     RefreshFeed,
