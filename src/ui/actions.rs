@@ -14,6 +14,28 @@ use crate::youtube::extractor::YouTubeExtractor;
 use super::app::MusicPlayerApp;
 
 impl MusicPlayerApp {
+    // -----------------------------------------------------------------------
+    // Shared helpers
+    // -----------------------------------------------------------------------
+
+    /// Add `tracks` to the queue, applying the music-only duration filter.
+    ///
+    /// Returns `(added, filtered)` counts. Does **not** trigger downloads —
+    /// callers are responsible for calling `trigger_smart_downloads()`.
+    fn add_filtered_tracks(&mut self, tracks: &[Track]) -> (usize, usize) {
+        let mut added = 0;
+        let mut filtered = 0;
+        for track in tracks {
+            if !self.ui.music_only_mode || track.duration <= MAX_TRACK_DURATION_SECS {
+                self.queue.add(track.clone());
+                added += 1;
+            } else {
+                filtered += 1;
+            }
+        }
+        (added, filtered)
+    }
+
     pub(super) async fn perform_search(&mut self, query: &str) {
         // Mark as searching
         self.search.is_searching = true;
@@ -71,19 +93,9 @@ impl MusicPlayerApp {
 
                 self.playlist.loaded_name = format!("Loaded Playlist ({} tracks)", track_count);
 
-                // Add tracks to queue (filter long tracks in music-only mode)
-                let mut added_count = 0;
-                let mut filtered_count = 0;
-                for track in &tracks {
-                    if !self.ui.music_only_mode || track.duration <= MAX_TRACK_DURATION_SECS {
-                        self.queue.add(track.clone());
-                        added_count += 1;
-                    } else {
-                        filtered_count += 1;
-                    }
-                }
+                let (added_count, filtered_count) = self.add_filtered_tracks(&tracks);
 
-                // Store loaded playlist for display (moved after iteration to avoid clone)
+                // Store loaded playlist for display
                 self.playlist.loaded_tracks = tracks;
 
                 // Trigger smart downloads
@@ -91,7 +103,7 @@ impl MusicPlayerApp {
 
                 if filtered_count > 0 {
                     self.status_message = format!(
-                        "Added {} tracks to queue ({} filtered — press 'f' to allow all)",
+                        "Added {} tracks to queue ({} filtered — press 'Shift+F' to allow all)",
                         added_count, filtered_count
                     );
                 } else {
@@ -141,24 +153,14 @@ impl MusicPlayerApp {
                         return;
                     }
 
-                    // Add tracks to queue (filter long tracks in music-only mode)
-                    let mut added_count = 0;
-                    let mut filtered_count = 0;
-                    for track in tracks {
-                        if !self.ui.music_only_mode || track.duration <= MAX_TRACK_DURATION_SECS {
-                            self.queue.add(track);
-                            added_count += 1;
-                        } else {
-                            filtered_count += 1;
-                        }
-                    }
+                    let (added_count, filtered_count) = self.add_filtered_tracks(&tracks);
 
                     // Trigger smart downloads
                     self.trigger_smart_downloads();
 
                     if filtered_count > 0 {
                         self.status_message = format!(
-                            "Added {} from '{}' ({} filtered — press 'f' to allow all)",
+                            "Added {} from '{}' ({} filtered — press 'Shift+F' to allow all)",
                             added_count, mix.title, filtered_count
                         );
                     } else {
@@ -306,13 +308,16 @@ impl MusicPlayerApp {
     /// exists. Returns `false` on miss (expired, missing, corrupt, schema
     /// mismatch) without modifying state.
     fn try_load_feed_cache(&mut self) -> bool {
-        let config_dir = match self.persistence.config_dir().to_owned().into_os_string().into_string() {
-            Ok(_) => self.persistence.config_dir().to_owned(),
-            Err(_) => return false,
-        };
-        let store = Self::feed_cache_store(config_dir);
+        let store = Self::feed_cache_store(self.persistence.config_dir().to_owned());
         match store.load() {
-            Ok(Some(sections)) => {
+            Ok(Some(mut sections)) => {
+                // Re-validate URLs loaded from disk — defence-in-depth matching
+                // the pattern used for queue restoration in load_queue_async.
+                for section in &mut sections {
+                    section
+                        .items
+                        .retain(|p| crate::config::is_allowed_youtube_url(&p.url));
+                }
                 self.feed.sections = sections;
                 self.feed.last_fetch = Some(std::time::Instant::now());
                 self.feed.last_error = None;
@@ -329,11 +334,16 @@ impl MusicPlayerApp {
     /// `force = true` is used when the user explicitly presses `r` — it
     /// bypasses the TTL check and always re-fetches.
     pub(super) async fn refresh_feed(&mut self, force: bool) {
+        // Prevent stacking multiple concurrent yt-dlp fan-outs.
+        if self.feed.is_loading {
+            self.status_message = "Feed refresh already in progress…".to_string();
+            return;
+        }
+
         if self.cookie_config().is_none() {
             self.feed.last_error = Some(
                 "No browser account selected. Press 'q' then 'l' to log in.".to_string(),
             );
-            self.feed.is_loading = false;
             return;
         }
 
@@ -376,7 +386,7 @@ impl MusicPlayerApp {
         CacheStore::new(
             config_dir.join("feed_cache.json"),
             Duration::from_secs(FEED_CACHE_TTL_SECS),
-            1, // schema_version — bump if FeedSection/FeedPlaylist shape changes
+            FeedSection::CACHE_SCHEMA_VERSION,
         )
     }
 
@@ -452,16 +462,7 @@ impl MusicPlayerApp {
 
         // Clear queue and load fresh tracks
         self.queue = crate::player::queue::Queue::new();
-        let mut added = 0;
-        let mut filtered = 0;
-        for track in &tracks {
-            if !self.ui.music_only_mode || track.duration <= crate::config::MAX_TRACK_DURATION_SECS {
-                self.queue.add(track.clone());
-                added += 1;
-            } else {
-                filtered += 1;
-            }
-        }
+        let (added, filtered) = self.add_filtered_tracks(&tracks);
 
         if added == 0 {
             self.status_message = format!("No playable tracks found in '{}'", item.title);
@@ -487,7 +488,7 @@ impl MusicPlayerApp {
 
         // Persist the new queue
         if let Err(e) = self.save_queue() {
-            eprintln!("Failed to save queue after feed play: {e}");
+            self.status_message = format!("Playing, but queue not saved: {e}");
         }
     }
 
@@ -519,16 +520,7 @@ impl MusicPlayerApp {
         };
 
         let was_empty = self.queue.is_empty();
-        let mut added = 0;
-        let mut filtered = 0;
-        for track in &tracks {
-            if !self.ui.music_only_mode || track.duration <= crate::config::MAX_TRACK_DURATION_SECS {
-                self.queue.add(track.clone());
-                added += 1;
-            } else {
-                filtered += 1;
-            }
-        }
+        let (added, filtered) = self.add_filtered_tracks(&tracks);
 
         if added == 0 {
             self.status_message = format!("No playable tracks found in '{}'", item.title);
@@ -561,7 +553,7 @@ impl MusicPlayerApp {
 
         // Persist
         if let Err(e) = self.save_queue() {
-            eprintln!("Failed to save queue after feed import: {e}");
+            self.status_message = format!("Imported, but queue not saved: {e}");
         }
     }
 
@@ -596,9 +588,8 @@ impl MusicPlayerApp {
             Ok(tracks) => Ok(tracks),
             Err(e) => {
                 // Surface auth-expired hint prominently
-                let msg = if e.to_lowercase().contains("sign in")
-                    || e.to_lowercase().contains("login")
-                {
+                let lower = e.to_lowercase();
+                let msg = if lower.contains("sign in") || lower.contains("login") {
                     format!(
                         "YouTube auth expired for '{}' — re-select your browser account (press 'q' then 'l')",
                         title

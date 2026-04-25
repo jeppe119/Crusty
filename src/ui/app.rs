@@ -298,7 +298,14 @@ impl MusicPlayerApp {
             if let Ok(result) = self.feed_rx.try_recv() {
                 self.feed.is_loading = false;
                 match result {
-                    Ok(sections) => {
+                    Ok(mut sections) => {
+                        // Validate URLs from the network path, matching the
+                        // pattern used for queue restoration.
+                        for section in &mut sections {
+                            section
+                                .items
+                                .retain(|p| is_allowed_youtube_url(&p.url));
+                        }
                         self.feed.sections = sections;
                         self.feed.last_fetch = Some(std::time::Instant::now());
                         self.feed.last_error = None;

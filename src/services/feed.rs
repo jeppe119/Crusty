@@ -226,10 +226,41 @@ fn run_yt_dlp(urls: &[&str], cookie_config: &(bool, String)) -> Result<String, F
     }
 
     if !output.status.success() {
-        return Err(FeedError::YtDlpFailed(stderr.trim().to_string()));
+        // Take only the first non-empty line, cap at 200 chars, and strip
+        // control characters so the message is safe to display in the TUI.
+        let snippet = stderr
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("unknown error");
+        let snippet = sanitize_text(&snippet.chars().take(200).collect::<String>());
+        return Err(FeedError::YtDlpFailed(snippet));
     }
 
     String::from_utf8(output.stdout).map_err(|e| FeedError::InvalidUtf8(e.to_string()))
+}
+
+/// Strip control characters from a string sourced from yt-dlp output.
+///
+/// Prevents terminal-escape injection (OSC 8 hyperlinks, cursor-positioning
+/// sequences, etc.) from reaching the ratatui renderer. Tabs are preserved;
+/// all other C0/C1 control characters are removed.
+pub(crate) fn sanitize_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect()
+}
+
+/// Returns `true` if `id` looks like a safe YouTube playlist ID.
+///
+/// Playlist IDs from yt-dlp should only contain alphanumerics, hyphens,
+/// and underscores. This guards the synthesised-URL fallback in
+/// `parse_entries` against a malformed `id` being embedded in a URL.
+fn is_safe_playlist_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Returns `true` if the yt-dlp stderr output indicates an authentication
@@ -274,11 +305,15 @@ pub(crate) fn parse_entries(stdout: &str) -> Vec<FeedPlaylist> {
             continue;
         }
 
-        let title = json["title"]
-            .as_str()
-            .or_else(|| json["playlist_title"].as_str())
-            .unwrap_or("Untitled")
-            .to_string();
+        // Sanitize all yt-dlp-derived strings to strip control characters
+        // (prevents terminal-escape injection in the TUI renderer).
+        let id = sanitize_text(&id);
+        let title = sanitize_text(
+            json["title"]
+                .as_str()
+                .or_else(|| json["playlist_title"].as_str())
+                .unwrap_or("Untitled"),
+        );
 
         let playlist_type = classify(&id, &title);
 
@@ -292,22 +327,27 @@ pub(crate) fn parse_entries(stdout: &str) -> Vec<FeedPlaylist> {
             .and_then(|arr| arr.first())
             .and_then(|t| t["url"].as_str())
             .or_else(|| json["thumbnail"].as_str())
-            .map(|s| s.to_string());
+            .map(sanitize_text);
 
         let description = json["description"]
             .as_str()
             .or_else(|| json["uploader"].as_str())
             .or_else(|| json["channel"].as_str())
-            .map(|s| s.to_string());
+            .map(sanitize_text);
 
-        // Canonicalise URL to music.youtube.com for Music playlists
-        let url = json["url"]
+        // Canonicalise URL to music.youtube.com for Music playlists.
+        // For the synthesised fallback, only use `id` if it passes the
+        // safe-ID check — otherwise skip this entry entirely.
+        let url = if let Some(raw_url) = json["url"]
             .as_str()
             .or_else(|| json["webpage_url"].as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                format!("https://music.youtube.com/playlist?list={}", id)
-            });
+        {
+            sanitize_text(raw_url)
+        } else if is_safe_playlist_id(&id) {
+            format!("https://music.youtube.com/playlist?list={id}")
+        } else {
+            continue; // unsafe id — skip rather than construct a bad URL
+        };
 
         entries.push(FeedPlaylist {
             id,

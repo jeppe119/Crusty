@@ -205,10 +205,17 @@ fn draw_items(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
                         String::new()
                     };
 
-                    // Truncate title to fit the column
-                    let max_title = area.width.saturating_sub(14) as usize;
-                    let title = if playlist.title.len() > max_title {
-                        format!("{}…", &playlist.title[..max_title.saturating_sub(1)])
+                    // Truncate by char count (not bytes) so CJK/emoji titles
+                    // never cause a UTF-8 boundary panic.
+                    let max_chars = (area.width as usize).saturating_sub(14);
+                    let char_count = playlist.title.chars().count();
+                    let title = if char_count > max_chars {
+                        let truncated: String = playlist
+                            .title
+                            .chars()
+                            .take(max_chars.saturating_sub(1))
+                            .collect();
+                        format!("{truncated}…")
                     } else {
                         playlist.title.clone()
                     };

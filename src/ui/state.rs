@@ -94,6 +94,13 @@ pub(crate) struct FeedSection {
     pub items: Vec<FeedPlaylist>,
 }
 
+impl FeedSection {
+    /// Bump this when `FeedSection` or `FeedPlaylist` gains/loses a field in a
+    /// serde-incompatible way. The `CacheStore` uses it to silently discard
+    /// stale cache files rather than failing to deserialize.
+    pub(crate) const CACHE_SCHEMA_VERSION: u32 = 1;
+}
+
 /// Runtime state for the feed browser view.
 #[derive(Debug, Default)]
 pub(crate) struct FeedState {
