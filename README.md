@@ -305,6 +305,11 @@ MIT
 
 ---
 
+> [!WARNING]
+> **Use at your own risk.** Automating YouTube playback and downloading content via `yt-dlp` may violate [YouTube's Terms of Service](https://www.youtube.com/t/terms). This project is intended for personal, non-commercial use only. The authors take no responsibility for any account suspension, legal action, or other consequences arising from its use. Always respect copyright and the rights of content creators.
+
+---
+
 <div align="center">
   <p>Made by <a href="https://github.com/jeppe119">jeppe119</a></p>
 </div>
