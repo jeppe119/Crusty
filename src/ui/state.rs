@@ -116,10 +116,12 @@ pub(crate) struct FeedTrack {
 /// Which pane is focused in the feed browser.
 #[derive(Debug, Default, PartialEq, Clone, Copy)]
 pub(crate) enum FeedFocus {
-    /// Navigating the playlist list (left/middle columns).
+    /// Left column — navigating the section list (Saved Mixes / My Playlists / Liked Music).
     #[default]
+    Sections,
+    /// Middle column — navigating items within the selected section.
     Playlists,
-    /// Navigating the expanded track list of the selected playlist.
+    /// Right column — navigating the expanded track list of the selected playlist.
     Tracks,
 }
 

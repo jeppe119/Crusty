@@ -127,8 +127,6 @@ fn draw_body(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
         ])
         .split(area);
 
-    draw_sections(app, frame, cols[0]);
-
     if app.feed.focus == FeedFocus::Tracks {
         draw_tracks(app, frame, cols[1]);
         draw_track_detail(app, frame, cols[2]);
@@ -136,6 +134,8 @@ fn draw_body(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
         draw_playlists(app, frame, cols[1]);
         draw_playlist_detail(app, frame, cols[2]);
     }
+    // Draw sections last so its border colour reflects the current focus.
+    draw_sections(app, frame, cols[0]);
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +143,8 @@ fn draw_body(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_sections(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
+    let sections_focused = app.feed.focus == FeedFocus::Sections;
+
     let items: Vec<ListItem> = if app.feed.sections.is_empty() {
         vec![ListItem::new("  (empty)").style(Style::default().fg(Color::DarkGray))]
     } else {
@@ -152,10 +154,12 @@ fn draw_sections(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
             .enumerate()
             .map(|(i, section)| {
                 let label = format!(" {} ({})", section.title, section.items.len());
-                let is_active = i == app.feed.selected_section;
-                let style = if is_active && app.feed.focus == FeedFocus::Playlists {
+                let is_selected = i == app.feed.selected_section;
+                let style = if is_selected && sections_focused {
+                    // Active row, this column has focus — bright + bold
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                } else if is_active {
+                } else if is_selected {
+                    // Active row, focus is elsewhere — dim highlight
                     Style::default().fg(Color::Cyan)
                 } else {
                     Style::default().fg(Color::White)
@@ -165,10 +169,17 @@ fn draw_sections(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
             .collect()
     };
 
+    // Border is bright when this column is focused, dim otherwise.
+    let border_style = if sections_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Sections ")
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(border_style);
     frame.render_widget(List::new(items).block(block), area);
 }
 
@@ -241,10 +252,16 @@ fn draw_playlists(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
         }
     };
 
+    let border_style = if app.feed.focus == FeedFocus::Playlists {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {section_title} "))
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(border_style);
     frame.render_widget(List::new(items).block(block), area);
 }
 
@@ -459,24 +476,21 @@ fn draw_track_detail(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_hint_bar(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
-    let hints = if app.feed.focus == FeedFocus::Tracks {
-        vec![
+    let hints = match app.feed.focus {
+        FeedFocus::Sections => vec![
             Span::styled("[j/k]", Style::default().fg(Color::Yellow)),
-            Span::raw(" Tracks  "),
-            Span::styled("[Enter]", Style::default().fg(Color::Green)),
-            Span::raw(" Play  "),
-            Span::styled("[a]", Style::default().fg(Color::Green)),
-            Span::raw(" Add  "),
-            Span::styled("[h/l]", Style::default().fg(Color::Cyan)),
-            Span::raw(" Back  "),
+            Span::raw(" Sections  "),
+            Span::styled("[l]", Style::default().fg(Color::Cyan)),
+            Span::raw(" Focus items  "),
+            Span::styled("[r]", Style::default().fg(Color::Cyan)),
+            Span::raw(" Refresh  "),
             Span::styled("[Esc/f]", Style::default().fg(Color::Red)),
             Span::raw(" Close"),
-        ]
-    } else {
-        vec![
+        ],
+        FeedFocus::Playlists => vec![
             Span::styled("[j/k]", Style::default().fg(Color::Yellow)),
             Span::raw(" Navigate  "),
-            Span::styled("[h/l]", Style::default().fg(Color::Yellow)),
+            Span::styled("[h]", Style::default().fg(Color::Cyan)),
             Span::raw(" Sections  "),
             Span::styled("[Enter]", Style::default().fg(Color::Green)),
             Span::raw(" Expand  "),
@@ -486,7 +500,19 @@ fn draw_hint_bar(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
             Span::raw(" Refresh  "),
             Span::styled("[Esc/f]", Style::default().fg(Color::Red)),
             Span::raw(" Close"),
-        ]
+        ],
+        FeedFocus::Tracks => vec![
+            Span::styled("[j/k]", Style::default().fg(Color::Yellow)),
+            Span::raw(" Tracks  "),
+            Span::styled("[Enter]", Style::default().fg(Color::Green)),
+            Span::raw(" Play  "),
+            Span::styled("[a]", Style::default().fg(Color::Green)),
+            Span::raw(" Add  "),
+            Span::styled("[h]", Style::default().fg(Color::Cyan)),
+            Span::raw(" Back  "),
+            Span::styled("[Esc/f]", Style::default().fg(Color::Red)),
+            Span::raw(" Close"),
+        ],
     };
 
     frame.render_widget(Paragraph::new(Line::from(hints)), area);
