@@ -22,18 +22,38 @@ impl MusicPlayerApp {
     ///
     /// Returns `(added, filtered)` counts. Does **not** trigger downloads —
     /// callers are responsible for calling `trigger_smart_downloads()`.
-    fn add_filtered_tracks(&mut self, tracks: &[Track]) -> (usize, usize) {
+    /// Returns the set of video IDs currently in the queue (for deduplication).
+    fn queued_video_ids(&self) -> std::collections::HashSet<String> {
+        self.queue
+            .get_queue_list()
+            .iter()
+            .map(|t| t.video_id.clone())
+            .collect()
+    }
+
+    /// Add tracks to the queue, skipping:
+    ///   - tracks already in the queue (deduplication by video_id)
+    ///   - tracks over the duration limit when music-only mode is on
+    ///
+    /// Returns `(added, skipped_duration, skipped_duplicate)`.
+    fn add_filtered_tracks(&mut self, tracks: &[Track]) -> (usize, usize, usize) {
+        let already_queued = self.queued_video_ids();
         let mut added = 0;
-        let mut filtered = 0;
+        let mut skipped_duration = 0;
+        let mut skipped_duplicate = 0;
         for track in tracks {
+            if already_queued.contains(&track.video_id) {
+                skipped_duplicate += 1;
+                continue;
+            }
             if !self.ui.music_only_mode || track.duration <= MAX_TRACK_DURATION_SECS {
                 self.queue.add(track.clone());
                 added += 1;
             } else {
-                filtered += 1;
+                skipped_duration += 1;
             }
         }
-        (added, filtered)
+        (added, skipped_duration, skipped_duplicate)
     }
 
     pub(super) async fn perform_search(&mut self, query: &str) {
@@ -93,7 +113,7 @@ impl MusicPlayerApp {
 
                 self.playlist.loaded_name = format!("Loaded Playlist ({} tracks)", track_count);
 
-                let (added_count, filtered_count) = self.add_filtered_tracks(&tracks);
+                let (added_count, skipped_dur, skipped_dup) = self.add_filtered_tracks(&tracks);
 
                 // Store loaded playlist for display
                 self.playlist.loaded_tracks = tracks;
@@ -101,10 +121,15 @@ impl MusicPlayerApp {
                 // Trigger smart downloads
                 self.trigger_smart_downloads();
 
-                if filtered_count > 0 {
+                if skipped_dur > 0 {
                     self.status_message = format!(
                         "Added {} tracks to queue ({} filtered — press 'Shift+F' to allow all)",
-                        added_count, filtered_count
+                        added_count, skipped_dur
+                    );
+                } else if skipped_dup > 0 {
+                    self.status_message = format!(
+                        "Added {} tracks to queue ({} already in queue)",
+                        added_count, skipped_dup
                     );
                 } else {
                     self.status_message = format!("Added {} tracks to queue", added_count);
@@ -153,15 +178,20 @@ impl MusicPlayerApp {
                         return;
                     }
 
-                    let (added_count, filtered_count) = self.add_filtered_tracks(&tracks);
+                    let (added_count, skipped_dur, skipped_dup) = self.add_filtered_tracks(&tracks);
 
                     // Trigger smart downloads
                     self.trigger_smart_downloads();
 
-                    if filtered_count > 0 {
+                    if skipped_dur > 0 {
                         self.status_message = format!(
                             "Added {} from '{}' ({} filtered — press 'Shift+F' to allow all)",
-                            added_count, mix.title, filtered_count
+                            added_count, mix.title, skipped_dur
+                        );
+                    } else if skipped_dup > 0 {
+                        self.status_message = format!(
+                            "Added {} from '{}' ({} already in queue)",
+                            added_count, mix.title, skipped_dup
                         );
                     } else {
                         self.status_message =
@@ -596,11 +626,6 @@ impl MusicPlayerApp {
         self.trigger_smart_downloads();
         self.play_current_or_first().await;
 
-        // Mark parent playlist as imported
-        if let Some(item) = self.feed_selected_item() {
-            self.feed.imported_ids.insert(item.id.clone());
-        }
-
         self.feed.focus = crate::ui::state::FeedFocus::Playlists;
         self.mode = AppMode::Normal;
         self.status_message = format!("▶ Playing '{}'", track.title);
@@ -611,6 +636,14 @@ impl MusicPlayerApp {
         let Some(track) = self.feed.expanded_tracks.get(self.feed.selected_track).cloned() else {
             return;
         };
+
+        // Deduplicate — don't add if already in queue
+        if self.queued_video_ids().contains(&track.video_id) {
+            let msg = format!("'{}' is already in the queue", track.title);
+            self.feed.feed_status = Some(msg.clone());
+            self.status_message = msg;
+            return;
+        }
 
         let queue_track = crate::player::queue::Track::new(
             track.video_id.clone(),
@@ -624,20 +657,19 @@ impl MusicPlayerApp {
         self.spawn_download_with_limit(&queue_track);
         self.queue.add(queue_track);
 
-        // Mark parent playlist as (partially) imported
-        if let Some(item) = self.feed_selected_item() {
-            self.feed.imported_ids.insert(item.id.clone());
-        }
-
-        self.status_message = format!(
+        let msg = format!(
             "✓ Added '{}' — {} in queue{}",
             track.title,
             self.queue.len(),
             if was_empty { " — press Space to play" } else { "" }
         );
+        self.feed.feed_status = Some(msg.clone());
+        self.status_message = msg;
 
         if let Err(e) = self.save_queue() {
-            self.status_message = format!("Added, but queue not saved: {e}");
+            let err = format!("Added, but queue not saved: {e}");
+            self.feed.feed_status = Some(err.clone());
+            self.status_message = err;
         }
     }
 
@@ -654,29 +686,35 @@ impl MusicPlayerApp {
             return;
         };
 
-        // Already imported this session — give feedback but don't re-fetch
-        if self.feed.imported_ids.contains(&item.id) {
-            self.status_message = format!("'{}' is already in the queue", item.title);
-            return;
-        }
-
-        self.status_message = format!("📥 Importing '{}'…", item.title);
+        let importing_msg = format!("📥 Importing '{}'…", item.title);
+        self.feed.feed_status = Some(importing_msg.clone());
+        self.status_message = importing_msg;
         tokio::task::yield_now().await;
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let tracks = match self.feed_load_tracks(&item.url, &item.title).await {
             Ok(t) => t,
             Err(msg) => {
+                self.feed.feed_status = Some(msg.clone());
                 self.status_message = msg;
                 return;
             }
         };
 
         let was_empty = self.queue.is_empty();
-        let (added, filtered) = self.add_filtered_tracks(&tracks);
+        let (added, skipped_duration, skipped_duplicate) = self.add_filtered_tracks(&tracks);
+
+        if added == 0 && skipped_duplicate == tracks.len() {
+            let msg = format!("All tracks from '{}' are already in the queue", item.title);
+            self.feed.feed_status = Some(msg.clone());
+            self.status_message = msg;
+            return;
+        }
 
         if added == 0 {
-            self.status_message = format!("No playable tracks found in '{}'", item.title);
+            let msg = format!("No playable tracks found in '{}'", item.title);
+            self.feed.feed_status = Some(msg.clone());
+            self.status_message = msg;
             return;
         }
 
@@ -686,27 +724,26 @@ impl MusicPlayerApp {
         // Kick off background downloads for the new tracks
         self.trigger_smart_downloads();
 
-        if filtered > 0 {
-            self.status_message = format!(
-                "✓ Added {} tracks from '{}' ({} filtered) — {} in queue",
-                added,
-                item.title,
-                filtered,
-                self.queue.len()
-            );
-        } else {
-            self.status_message = format!(
-                "✓ Added {} tracks from '{}' — {} in queue{}",
-                added,
-                item.title,
-                self.queue.len(),
-                if was_empty { " — press Space to play" } else { "" }
-            );
+        let mut parts = vec![format!("✓ Added {} tracks from '{}'", added, item.title)];
+        if skipped_duplicate > 0 {
+            parts.push(format!("{} already in queue", skipped_duplicate));
         }
+        if skipped_duration > 0 {
+            parts.push(format!("{} filtered (too long)", skipped_duration));
+        }
+        parts.push(format!("{} in queue", self.queue.len()));
+        if was_empty && added > 0 {
+            parts.push("press Space to play".to_string());
+        }
+        let msg = parts.join(" — ");
+        self.feed.feed_status = Some(msg.clone());
+        self.status_message = msg;
 
         // Persist
         if let Err(e) = self.save_queue() {
-            self.status_message = format!("Imported, but queue not saved: {e}");
+            let err = format!("Imported, but queue not saved: {e}");
+            self.feed.feed_status = Some(err.clone());
+            self.status_message = err;
         }
     }
 

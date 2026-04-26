@@ -142,8 +142,12 @@ pub(crate) struct FeedState {
     pub last_fetch: Option<std::time::Instant>,
     /// Last error message to display in the feed browser.
     pub last_error: Option<String>,
-    /// IDs of playlists that have been imported (whole or partially) this session.
+    /// IDs of playlists that have been **fully** added to the queue this session
+    /// (shows ✓ checkmark). Single-track plays and expansions do NOT set this.
     pub imported_ids: std::collections::HashSet<String>,
+    /// Transient status message shown in the feed browser status bar.
+    /// Cleared on next fetch or when the browser closes.
+    pub feed_status: Option<String>,
     /// Tracks expanded from the currently selected playlist.
     pub expanded_tracks: Vec<FeedTrack>,
     /// Which track is highlighted in the expanded track list.

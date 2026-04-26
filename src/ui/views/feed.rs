@@ -74,40 +74,54 @@ pub(crate) fn draw(app: &MusicPlayerApp, frame: &mut Frame) {
 // ---------------------------------------------------------------------------
 
 fn draw_status_bar(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
-    let text = if app.feed.tracks_loading {
+    // Priority: spinner > feed_status (action feedback) > error > track position > fetch time
+    let (text, style) = if app.feed.tracks_loading {
         let spinner = SPINNER[(app.ui.animation_frame as usize) % SPINNER.len()];
-        format!("{spinner} Loading tracks…")
+        (
+            format!("{spinner} Loading tracks…"),
+            Style::default().fg(Color::Yellow),
+        )
     } else if app.feed.is_loading {
         let spinner = SPINNER[(app.ui.animation_frame as usize) % SPINNER.len()];
-        format!("{spinner} Fetching feed via yt-dlp…")
+        (
+            format!("{spinner} Fetching feed via yt-dlp…"),
+            Style::default().fg(Color::Yellow),
+        )
+    } else if let Some(ref msg) = app.feed.feed_status {
+        // Action feedback: add/import confirmations, errors from queue ops
+        let style = if msg.starts_with('✓') {
+            Style::default().fg(Color::Green)
+        } else if msg.starts_with('⚠') || msg.starts_with("No ") || msg.starts_with("Failed") {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        (msg.clone(), style)
+    } else if let Some(ref err) = app.feed.last_error {
+        (format!("⚠  {err}"), Style::default().fg(Color::Red))
     } else if app.feed.focus == FeedFocus::Tracks {
         let count = app.feed.expanded_tracks.len();
         let sel = app.feed.selected_track + 1;
-        format!("Track {sel} / {count}  —  [Enter] Play  [a] Add to queue  [h/l] Back to playlists")
-    } else if let Some(ref err) = app.feed.last_error {
-        format!("⚠  {err}")
+        (
+            format!("Track {sel} / {count}"),
+            Style::default().fg(Color::Cyan),
+        )
     } else if app.feed.sections.is_empty() {
-        "No feed loaded — press [r] to fetch".to_string()
+        (
+            "No feed loaded — press [r] to fetch".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
     } else if let Some(instant) = app.feed.last_fetch {
         let secs = instant.elapsed().as_secs();
-        if secs < 60 {
+        let text = if secs < 60 {
             format!("✓ Updated just now  ({} sections)", app.feed.sections.len())
         } else {
             let mins = secs / 60;
             format!("✓ Updated {mins} min ago  ({} sections)", app.feed.sections.len())
-        }
+        };
+        (text, Style::default().fg(Color::DarkGray))
     } else {
-        String::new()
-    };
-
-    let style = if app.feed.last_error.is_some() && app.feed.focus != FeedFocus::Tracks {
-        Style::default().fg(Color::Red)
-    } else if app.feed.is_loading || app.feed.tracks_loading {
-        Style::default().fg(Color::Yellow)
-    } else if app.feed.focus == FeedFocus::Tracks {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
+        (String::new(), Style::default().fg(Color::DarkGray))
     };
 
     frame.render_widget(Paragraph::new(text).style(style), area);
