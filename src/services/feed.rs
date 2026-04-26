@@ -155,6 +155,14 @@ pub(crate) fn fetch_library_playlists(
     let entries = parse_entries(&stdout)
         .into_iter()
         .filter(|p| !SKIP_IDS.contains(&p.id.as_str()))
+        .map(|mut p| {
+            // The feed/playlists endpoint returns `playlist_count` = the number
+            // of playlists in the feed page (always 7 in testing), NOT the track
+            // count of each individual playlist. Zero it out so the UI shows "—"
+            // rather than a misleading number. The real count is fetched on expand.
+            p.track_count_estimate = 0;
+            p
+        })
         .collect::<Vec<_>>();
 
     // Split into mixes (RDCLAK/RDAMPL) and regular playlists.

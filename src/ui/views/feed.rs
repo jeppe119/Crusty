@@ -226,7 +226,7 @@ fn draw_playlists(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
                     let count_str = if playlist.track_count_estimate > 0 {
                         format!("  {:>3} trk", playlist.track_count_estimate)
                     } else {
-                        String::new()
+                        "    — trk".to_string()
                     };
 
                     let max_chars = (area.width as usize).saturating_sub(16);
@@ -371,15 +371,17 @@ fn draw_playlist_detail(app: &MusicPlayerApp, frame: &mut Frame, area: Rect) {
         ]),
     ];
 
-    if playlist.track_count_estimate > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("Tracks: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                playlist.track_count_estimate.to_string(),
-                Style::default().fg(Color::White),
-            ),
-        ]));
-    }
+    lines.push(Line::from(vec![
+        Span::styled("Tracks: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            if playlist.track_count_estimate > 0 {
+                playlist.track_count_estimate.to_string()
+            } else {
+                "unknown (expand to load)".to_string()
+            },
+            Style::default().fg(Color::White),
+        ),
+    ]));
 
     if let Some(ref desc) = playlist.description {
         lines.push(Line::from(""));
