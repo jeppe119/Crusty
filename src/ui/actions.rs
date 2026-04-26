@@ -255,7 +255,7 @@ impl MusicPlayerApp {
 
     pub(super) fn add_selected_to_queue(&mut self) {
         if let Some(video) = self.search.results.get(self.ui.selected_result) {
-            // In music-only mode, filter out tracks > 5 minutes
+            // In music-only mode, filter out tracks > 7 minutes
             if self.ui.music_only_mode && video.duration > MAX_TRACK_DURATION_SECS {
                 let clean_title = clean_title(&video.title);
                 let mins = video.duration / 60;

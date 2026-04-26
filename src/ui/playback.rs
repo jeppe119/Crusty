@@ -179,13 +179,13 @@ impl MusicPlayerApp {
     pub(super) fn seek_forward(&mut self) {
         self.player.seek_relative(10.0);
         self.player.apply_seek();
-        self.status_message = format!("Seeked +10s ({})", format_time(self.player.get_time_pos()));
+        self.set_status(format!("Seeked +10s ({})", format_time(self.player.get_time_pos())));
     }
 
     pub(super) fn seek_backward(&mut self) {
         self.player.seek_relative(-10.0);
         self.player.apply_seek();
-        self.status_message = format!("Seeked -10s ({})", format_time(self.player.get_time_pos()));
+        self.set_status(format!("Seeked -10s ({})", format_time(self.player.get_time_pos())));
     }
 
     /// Resume playback from saved state if a matching cached file exists.

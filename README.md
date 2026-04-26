@@ -43,7 +43,7 @@ A terminal YouTube Music player built in Rust. Uses `yt-dlp` for extraction and 
 - Resume playback position on restart
 - Background pre-downloading of upcoming tracks (lookahead)
 - Persistent download cache — cached tracks play instantly on restart
-- Music-only filter (`Shift+F`) — filters tracks >5 min, toggle off for podcasts
+- Music-only filter (`Shift+F`) — filters tracks >7 min, toggle off for podcasts/long mixes
 
 ### Search & Playlists
 - Search YouTube for songs and videos
@@ -51,10 +51,13 @@ A terminal YouTube Music player built in Rust. Uses `yt-dlp` for extraction and 
 - Queue management with history, delete, and clear
 
 ### YouTube Music Feed Browser
-- Browse your **Liked Music** and **My Playlists** directly in the TUI — no browser needed
+- Browse your **full library** directly in the TUI — Saved Mixes, owned playlists, saved playlists, Liked Music
+- Fetches from `youtube.com/feed/playlists` — returns everything in your library in one request
+- **Three-column navigation**: Sections (left) → Items (middle) → Tracks (right), vim-style `h/l` to move between columns
 - **Expand any playlist** to see individual tracks and cherry-pick what to add
 - Add a single track to the queue or play it immediately
-- Add an entire playlist to the queue in one action
+- Add an entire playlist to the queue in one action — duplicates automatically skipped
+- Status bar shows action feedback (added count, duplicates skipped, filtered count)
 - 30-minute disk cache (`feed_cache.json`) — reopening the feed is instant
 - Force-refresh with `r` to bypass the cache
 - Fetches via browser cookies — no OAuth, no API keys required
@@ -82,8 +85,6 @@ A terminal YouTube Music player built in Rust. Uses `yt-dlp` for extraction and 
 | **Audio** | `rodio` (pure Rust) |
 | **JSON** | `serde` + `serde_json` |
 | **Atomic writes** | `tempfile` |
-
-> **Note:** `reqwest` is listed in the old README but is not used — all network access goes through `yt-dlp`.
 
 ---
 
@@ -135,7 +136,7 @@ cp target/release/crusty ~/.local/bin/crusty
 
 | Key | Action |
 |-----|--------|
-| `Space` | Play / Pause (smart: plays selected queue item, or starts first track) |
+| `Space` | Play / Pause |
 | `n` | Next track |
 | `p` | Previous track |
 | `↑` / `Shift+↑` | Volume up +1% / +5% |
@@ -163,10 +164,11 @@ cp target/release/crusty ~/.local/bin/crusty
 | Key | Action |
 |-----|--------|
 | `f` | Open YouTube Music Feed Browser |
-| `j / k` | Navigate playlists or tracks |
-| `h / l` | Switch sections (playlist mode) / Back to playlists (track mode) |
-| `Enter` | Expand playlist → show tracks / Play selected track |
-| `a` | Add whole playlist to queue (playlist mode) / Add single track (track mode) |
+| `j / k` | Navigate sections (left column) or items (middle) or tracks (right) |
+| `l` / `→` | Move focus right (Sections → Items → Tracks) |
+| `h` / `←` | Move focus left / collapse track view |
+| `Enter` | Expand playlist into tracks / Play selected track |
+| `a` | Add whole playlist to queue / Add single track (track view) |
 | `r` | Force-refresh feed (bypasses 30-min cache) |
 | `Esc / f` | Close feed browser |
 
@@ -177,7 +179,7 @@ cp target/release/crusty ~/.local/bin/crusty
 | `/` | Search YouTube |
 | `l` | Load playlist from URL |
 | `o` | Switch account / Log out |
-| `Shift+F` | Toggle music-only filter (>5 min filtered) |
+| `Shift+F` | Toggle music-only filter (>7 min filtered) |
 | `?` | Show help screen |
 | `q` | Quit |
 
@@ -204,7 +206,7 @@ Crusty/
     ├── services/
     │   ├── cache_store.rs      # Generic TTL + schema-versioned file cache
     │   ├── download.rs         # Background download manager
-    │   ├── feed.rs             # YouTube Music feed scraping (liked, playlists)
+    │   ├── feed.rs             # YouTube Music feed scraping (library, liked, mixes)
     │   ├── persistence.rs      # History/queue/state save/load (atomic JSON)
     │   └── playlist.rs         # Playlist fetching via yt-dlp
     │
@@ -220,7 +222,7 @@ Crusty/
         ├── navigation.rs       # List cursor movement
         ├── actions.rs          # Search, playlist, feed, login actions
         └── views/              # Draw modules
-            ├── feed.rs         # YouTube Music feed browser (2-mode)
+            ├── feed.rs         # YouTube Music feed browser (3-column)
             ├── help.rs         # Help screen
             ├── history.rs      # Playback history
             ├── login.rs        # Login / account picker
@@ -234,52 +236,25 @@ Crusty/
 
 ## How the Feed Browser Works
 
-yt-dlp does not support scraping the YouTube Music personalised home feed
-(`music.youtube.com/feed/music`) — that page uses a private InnerTube API.
-The auto-generated `RDCLAK*` mixes are session-generated and have no stable URL.
+Crusty fetches your full YouTube library from `youtube.com/feed/playlists` using your browser cookies. This single endpoint returns everything in one request:
 
-What Crusty fetches instead (both work reliably with browser cookies):
+| Type | ID prefix | Example |
+|------|-----------|---------|
+| Saved Mixes | `RDCLAK*`, `RDAMPL*` | YouTube Music curated playlists |
+| Liked Music | `LM` | Your liked songs |
+| Your playlists | `PL*` | Playlists you created |
+| Saved playlists | `PL*` | Playlists saved from other creators |
 
-| Source | URL | What you get |
-|--------|-----|-------------|
-| Liked Music | `music.youtube.com/playlist?list=LM` | All your liked songs |
-| My Playlists | `youtube.com/channel/{your_id}/playlists` | Playlists you've created or saved |
+System playlists (Watch Later, History) are filtered out automatically.
 
-The channel ID is extracted automatically from the Liked Music response — no
-configuration needed.
+Track counts are not available from the listing endpoint — they appear after expanding a playlist with `Enter`.
 
 ---
 
 ## Known Issues
 
 - YouTube API / yt-dlp changes can break extraction (update yt-dlp if things stop working: `pip install -U yt-dlp`)
-- The YouTube Music personalised home feed (auto-mixes) is not accessible via yt-dlp
 - UI may not render well in very small terminals (minimum ~80×24 recommended)
-
----
-
-## Recent Changes
-
-### Feed Browser (latest)
-- Full YouTube Music feed browser (`f` key) with two-mode navigation
-- **Playlist mode**: browse Liked Music and your own playlists
-- **Track mode**: expand any playlist to see individual tracks, cherry-pick with `a` or play with `Enter`
-- 30-minute disk cache with atomic writes and schema versioning
-- Parallel fetch (liked + playlists run concurrently)
-- Account switcher / logout (`o` key) accessible from anywhere
-
-### Security & Reliability
-- Atomic file writes (`tempfile` + `rename`) for all persisted state — no torn files on crash
-- `sanitize_text()` strips terminal-escape sequences from all yt-dlp output before rendering
-- URL allowlist validation on all feed data loaded from disk or network
-- `is_safe_playlist_id()` guard on synthesised URLs
-
-### Previous
-- Persistent download cache — cached tracks play instantly on restart
-- Resume playback position and volume across sessions
-- Native seeking with `try_seek` (forward and backward)
-- Zen Browser support (multi-profile)
-- Smart download management (max 5 concurrent, lookahead pre-downloading)
 
 ---
 

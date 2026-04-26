@@ -70,7 +70,7 @@ pub(crate) fn draw_help_screen(_app: &MusicPlayerApp, frame: &mut Frame) {
         bind("a",       "Add selected playlist to queue"),
         blank(),
         section("FILTER"),
-        bind("Shift+F", "Toggle music-only mode (>5 min filtered)"),
+        bind("Shift+F", "Toggle music-only mode (>7 min filtered)"),
         blank(),
         section("ACCOUNT"),
         bind("l",       "Select account (login screen)"),

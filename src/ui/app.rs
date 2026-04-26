@@ -25,6 +25,25 @@ use crate::ui::state::{AppMode, FeedSection, FeedState, PlaylistState, QueueStat
 use crate::youtube::browser_auth::{BrowserAccount, BrowserAuth};
 use crate::youtube::extractor::VideoInfo;
 
+/// Scroll `text` by `offset` characters, wrapping around with a separator gap.
+/// Used to make the controls bar scroll so all keys are visible over time.
+fn scroll_text(text: &str, offset: usize) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    // Add a visual separator between the end and the start of the loop.
+    let separator = "   ·   ";
+    let full = format!("{text}{separator}");
+    let chars: Vec<char> = full.chars().collect();
+    let len = chars.len();
+    let start = offset % len;
+    // Collect from start, wrapping around.
+    chars[start..]
+        .iter()
+        .chain(chars[..start].iter())
+        .collect()
+}
+
 pub struct MusicPlayerApp {
     // Core modules
     pub(crate) player: AudioPlayer,
@@ -43,6 +62,10 @@ pub struct MusicPlayerApp {
     previous_view: ViewMode,
     should_quit: bool,
     pub(crate) status_message: String,
+    /// When the current status_message was set — used to auto-clear after 5s.
+    status_message_set_at: Option<std::time::Instant>,
+    /// Snapshot of status_message when the timer started — detects changes.
+    status_message_snapshot: String,
     queue_loaded: bool,
 
     // Async channels
@@ -122,6 +145,8 @@ impl MusicPlayerApp {
             } else {
                 status_message
             },
+            status_message_set_at: Some(std::time::Instant::now()),
+            status_message_snapshot: String::new(),
             queue_loaded: false,
             downloads: DownloadManager::with_cache(download_cache),
             search_rx,
@@ -132,6 +157,13 @@ impl MusicPlayerApp {
             pending_play_track: None,
             currently_downloading: None,
         })
+    }
+
+    /// Set a status message and record when it was set for auto-clear.
+    /// All status_message assignments should go through this so the timer resets.
+    pub(crate) fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = msg.into();
+        self.status_message_set_at = Some(std::time::Instant::now());
     }
 
     pub(super) fn cookie_config(&self) -> Option<(bool, String)> {
@@ -284,6 +316,27 @@ impl MusicPlayerApp {
                 self.ui.title_scroll_offset = self.ui.title_scroll_offset.wrapping_add(1);
 
                 self.ui.last_animation_update = now;
+            }
+
+            // Auto-clear status message after 5 seconds — reverts to controls bar.
+            // Detects message changes by comparing against a snapshot so the timer
+            // resets whenever any code writes a new message (no need to call set_status).
+            const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+            if !self.status_message.is_empty() {
+                if self.status_message != self.status_message_snapshot {
+                    // Message changed — restart the timer.
+                    self.status_message_set_at = Some(now);
+                    self.status_message_snapshot = self.status_message.clone();
+                } else if let Some(set_at) = self.status_message_set_at {
+                    if now.duration_since(set_at) >= STATUS_TTL {
+                        self.status_message.clear();
+                        self.status_message_snapshot.clear();
+                        self.status_message_set_at = None;
+                    }
+                }
+            } else {
+                self.status_message_set_at = None;
+                self.status_message_snapshot.clear();
             }
 
             // Check for search results
@@ -527,7 +580,12 @@ impl MusicPlayerApp {
                         } else {
                             String::new()
                         };
-                    format!("Controls: [/]Search [l]LoadPlaylist [Enter]Add [n]Next [p]Prev [Space]Play/Pause [j/k]Navigate [Shift+↑/↓]Volume [?]Help [q]Quit{}", account_info)
+                    let controls = format!(
+                        "Controls: [/]Search [l]LoadPlaylist [Enter]Add [n]Next [p]Prev [Space]Play/Pause [j/k]Navigate [Shift+↑/↓]Volume [?]Help [q]Quit{}",
+                        account_info
+                    );
+                    // Scroll the controls string so all keys are visible over time.
+                    scroll_text(&controls, self.ui.title_scroll_offset)
                 }
                 AppMode::LoginPrompt => "Login Required".to_string(),
                 AppMode::AccountPicker => "Select YouTube Account".to_string(),
@@ -716,7 +774,7 @@ impl MusicPlayerApp {
             AppCommand::ToggleMusicOnlyMode => {
                 self.ui.music_only_mode = !self.ui.music_only_mode;
                 self.status_message = if self.ui.music_only_mode {
-                    "Music mode ON (tracks >5min filtered)".to_string()
+                    "Music mode ON (tracks >7min filtered)".to_string()
                 } else {
                     "All content mode (no duration filter)".to_string()
                 };
