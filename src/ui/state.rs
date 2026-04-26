@@ -98,7 +98,9 @@ impl FeedSection {
     /// Bump this when `FeedSection` or `FeedPlaylist` gains/loses a field in a
     /// serde-incompatible way. The `CacheStore` uses it to silently discard
     /// stale cache files rather than failing to deserialize.
-    pub(crate) const CACHE_SCHEMA_VERSION: u32 = 1;
+    /// Bumped to 2: feed/playlists replaces channel/playlists — section titles
+    /// and structure changed (added "Saved Mixes", renamed "My Playlists").
+    pub(crate) const CACHE_SCHEMA_VERSION: u32 = 2;
 }
 
 /// A single track inside an expanded feed playlist.

@@ -6,11 +6,12 @@
 //!
 //! # Entry points
 //!
-//! - [`fetch_home`] — YouTube Music home page (Mixes, Recommended, Listen Again)
-//! - [`fetch_library`] — user's saved/imported playlists
-//! - [`fetch_liked`] — the "Liked Music" auto-playlist
+//! - [`fetch_liked`] — the "Liked Music" auto-playlist (`list=LM`)
+//! - [`fetch_library_playlists`] — all playlists from `youtube.com/feed/playlists`
+//!   (owned, saved, mixes — everything the user has in their library)
+//! - [`fetch_all_parallel`] — fetches both in parallel and merges results
 //!
-//! All three return [`FeedSection`]s containing [`FeedPlaylist`] entries.
+//! All functions return [`FeedSection`]s containing [`FeedPlaylist`] entries.
 
 use std::process::Command;
 
@@ -58,7 +59,7 @@ impl FeedError {
 /// Fetch the user's "Liked Music" playlist from YouTube Music (`list=LM`).
 ///
 /// Also extracts the user's YouTube channel ID from the response metadata,
-/// which is used by [`fetch_user_playlists`] to find their saved playlists.
+/// retained for potential future use. Current callers ignore it.
 ///
 /// Returns a `(FeedSection, Option<channel_id>)` tuple.
 pub(crate) fn fetch_liked(
@@ -115,75 +116,131 @@ pub(crate) fn fetch_liked(
     ))
 }
 
-/// Fetch the user's own public playlists via their YouTube channel page.
-///
-/// Uses the channel ID extracted from [`fetch_liked`]. Returns a
-/// `LibrarySaved` section containing all playlists the user has created
-/// or saved on their channel.
-pub(crate) fn fetch_user_playlists(
-    cookie_config: Option<(bool, String)>,
-    channel_id: &str,
-) -> Result<FeedSection, FeedError> {
-    if !is_safe_playlist_id(channel_id) && !channel_id.starts_with("UC") {
-        return Err(FeedError::YtDlpFailed("Invalid channel ID".into()));
-    }
 
+/// Fetch all playlists from `youtube.com/feed/playlists`.
+///
+/// This single endpoint returns **everything** in the user's library:
+/// - Saved YouTube Music mixes (`RDCLAK*`)
+/// - Playlists created by the user (`PL*`)
+/// - Playlists saved from other creators (`PL*`)
+/// - Private playlists
+///
+/// System playlists (`WL` — Watch Later, `LL` — Liked Videos) are filtered
+/// out because they are either irrelevant or already covered by [`fetch_liked`].
+///
+/// Returns two sections: "Saved Mixes" (RDCLAK/RDAMPL) and "My Playlists"
+/// (everything else), omitting whichever is empty.
+pub(crate) fn fetch_library_playlists(
+    cookie_config: Option<(bool, String)>,
+) -> Result<Vec<FeedSection>, FeedError> {
     let cookie_config = cookie_config.ok_or(FeedError::NoCookies)?;
-    let url = format!(
-        "https://www.youtube.com/channel/{channel_id}/playlists?view=1&sort=dd"
-    );
-    let stdout = run_yt_dlp(&[url.as_str()], &cookie_config)?;
+    let stdout = run_yt_dlp(
+        &["https://www.youtube.com/feed/playlists"],
+        &cookie_config,
+    )?;
 
     if stdout.trim().is_empty() {
-        return Err(FeedError::YtDlpFailed("No playlists found on channel".into()));
+        // Empty output is not fatal — user may have no saved playlists.
+        return Ok(Vec::new());
     }
+
+    // IDs to skip — system playlists covered elsewhere or not useful.
+    const SKIP_IDS: &[&str] = &[
+        "WL", // Watch Later
+        "LL", // Liked Videos (covered by fetch_liked / list=LM)
+        "LM", // Liked Music — defensive, already fetched separately
+        "HL", // Watch History pseudo-playlist (defensive)
+    ];
 
     let entries = parse_entries(&stdout)
         .into_iter()
-        .filter(|p| matches!(p.playlist_type, PlaylistType::LibrarySaved | PlaylistType::Unknown))
+        .filter(|p| !SKIP_IDS.contains(&p.id.as_str()))
         .collect::<Vec<_>>();
 
-    Ok(FeedSection {
-        title: "My Playlists".to_string(),
-        kind: PlaylistType::LibrarySaved,
-        items: entries,
-    })
+    // Split into mixes (RDCLAK/RDAMPL) and regular playlists.
+    let mut mixes = Vec::new();
+    let mut playlists = Vec::new();
+
+    for entry in entries {
+        match entry.playlist_type {
+            PlaylistType::Mix => mixes.push(entry),
+            // LibraryLiked should never appear here (LM is in SKIP_IDS above),
+            // but if it does, treat it as a regular playlist rather than silently
+            // dropping it. Exhaustive match ensures new variants force a decision.
+            PlaylistType::LibrarySaved
+            | PlaylistType::Recommended
+            | PlaylistType::ListenAgain
+            | PlaylistType::LibraryLiked
+            | PlaylistType::Unknown => playlists.push(entry),
+        }
+    }
+
+    let mut sections = Vec::new();
+
+    if !mixes.is_empty() {
+        sections.push(FeedSection {
+            title: "Saved Mixes".to_string(),
+            kind: PlaylistType::Mix,
+            items: mixes,
+        });
+    }
+
+    if !playlists.is_empty() {
+        sections.push(FeedSection {
+            title: "My Playlists".to_string(),
+            kind: PlaylistType::LibrarySaved,
+            items: playlists,
+        });
+    }
+
+    Ok(sections)
 }
 
-/// Fetch all available feed sources in parallel and merge into a single list.
+/// Fetch all available feed sources and merge into a single ordered list.
 ///
-/// **What yt-dlp actually supports (as of 2026):**
+/// **What yt-dlp supports (as of 2026):**
 /// - `playlist?list=LM` — Liked Music ✅ (requires cookies)
-/// - `channel/{id}/playlists` — user's own playlists ✅ (requires cookies)
-/// - `music.youtube.com/feed/music` — personalised home feed ❌ (not supported by yt-dlp)
+/// - `youtube.com/feed/playlists` — full library (owned + saved + mixes) ✅
+/// - `music.youtube.com/feed/music` — personalised home feed ❌ (not supported)
 /// - `music.youtube.com/library/playlists` — library ❌ (404s even with cookies)
 ///
-/// Strategy: fetch Liked Music first (mandatory, also gives us the channel ID),
-/// then fetch the user's playlists in parallel. Partial success is tolerated.
+/// Strategy: fetch Liked Music first (mandatory — also acts as the auth gate),
+/// then fetch the full library feed. The two calls are sequential; the library
+/// fetch is non-fatal — if it fails, Liked Music is still returned.
+///
+/// Note: despite the name, the fetches are sequential (both are blocking
+/// yt-dlp subprocesses). The caller in `actions.rs` wraps this in
+/// `spawn_blocking` so it does not block the async runtime.
 pub(crate) fn fetch_all_parallel(
     cookie_config: Option<(bool, String)>,
 ) -> Result<Vec<FeedSection>, FeedError> {
     let cookie_config = cookie_config.ok_or(FeedError::NoCookies)?;
 
-    // Step 1: fetch liked music — mandatory, also extracts channel ID.
-    let (liked_section, channel_id) = fetch_liked(Some(cookie_config.clone()))?;
+    // Step 1: Liked Music — mandatory (auth check).
+    let (liked_section, _channel_id) = fetch_liked(Some(cookie_config.clone()))?;
 
-    // Step 2: fetch user playlists in background if we have a channel ID.
-    let playlists_result: Option<Result<FeedSection, FeedError>> =
-        channel_id.as_deref().map(|cid| {
-            fetch_user_playlists(Some(cookie_config.clone()), cid)
-        });
+    // Step 2: Full library feed — optional, failure is non-fatal.
+    // Auth failures are already caught by fetch_liked above; this handles
+    // transient errors (network, yt-dlp version drift, etc.).
+    let library_sections = match fetch_library_playlists(Some(cookie_config)) {
+        Ok(s) => s,
+        Err(e) => {
+            // Non-fatal: surface in logs so the user can diagnose if needed.
+            eprintln!("[crusty] library feed fetch failed (non-fatal): {e}");
+            Vec::new()
+        }
+    };
 
     let mut sections = Vec::new();
 
-    // User playlists first (most useful for navigation)
-    if let Some(Ok(playlists)) = playlists_result {
-        if !playlists.items.is_empty() {
-            sections.push(playlists);
+    // Library sections first (Saved Mixes, then My Playlists)
+    for section in library_sections {
+        if !section.items.is_empty() {
+            sections.push(section);
         }
     }
 
-    // Liked music always last
+    // Liked Music always last
     if !liked_section.items.is_empty() {
         sections.push(liked_section);
     }
@@ -205,6 +262,12 @@ pub(crate) fn fetch_tracks_for_playlist(
     cookie_config: Option<(bool, String)>,
     url: &str,
 ) -> Result<Vec<crate::ui::state::FeedTrack>, FeedError> {
+    if !crate::config::is_allowed_youtube_url(url) {
+        return Err(FeedError::YtDlpFailed(format!(
+            "Blocked non-YouTube URL: {}",
+            url.chars().take(100).collect::<String>()
+        )));
+    }
     let cookie_config = cookie_config.ok_or(FeedError::NoCookies)?;
     let stdout = run_yt_dlp(&[url], &cookie_config)?;
 
@@ -839,6 +902,79 @@ mod tests {
         assert_eq!(sections[0].title, "My Mixes");
     }
 
+    // -- fetch_library_playlists filtering logic --
+
+    #[test]
+    fn library_playlists_skips_watch_later_and_liked_videos() {
+        // WL, LL, LM, HL should all be filtered out
+        const SKIP_IDS: &[&str] = &["WL", "LL", "LM", "HL"];
+        let input = concat!(
+            r#"{"_type":"url","id":"WL","title":"Watch later","url":"https://www.youtube.com/playlist?list=WL"}"#,
+            "\n",
+            r#"{"_type":"url","id":"LL","title":"Liked videos","url":"https://www.youtube.com/playlist?list=LL"}"#,
+            "\n",
+            r#"{"_type":"url","id":"LM","title":"Liked Music","url":"https://www.youtube.com/playlist?list=LM"}"#,
+            "\n",
+            r#"{"_type":"url","id":"HL","title":"History","url":"https://www.youtube.com/playlist?list=HL"}"#,
+            "\n",
+            r#"{"_type":"url","id":"RDCLAK5uy_abc","title":"Noise Riot: Rock Hits","url":"https://www.youtube.com/playlist?list=RDCLAK5uy_abc"}"#,
+            "\n",
+            r#"{"_type":"url","id":"PLtest123","title":"My Gaming Playlist","url":"https://www.youtube.com/playlist?list=PLtest123"}"#,
+        );
+        let entries = parse_entries(input)
+            .into_iter()
+            .filter(|p| !SKIP_IDS.contains(&p.id.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "RDCLAK5uy_abc");
+        assert_eq!(entries[1].id, "PLtest123");
+    }
+
+    #[test]
+    fn library_playlists_splits_mixes_and_playlists() {
+        let input = concat!(
+            r#"{"_type":"url","id":"RDCLAK5uy_abc","title":"Rock Mix","url":"https://www.youtube.com/playlist?list=RDCLAK5uy_abc"}"#,
+            "\n",
+            r#"{"_type":"url","id":"RDAMPL_xyz","title":"Chill Mix","url":"https://www.youtube.com/playlist?list=RDAMPL_xyz"}"#,
+            "\n",
+            r#"{"_type":"url","id":"PLtest123","title":"My Playlist","url":"https://www.youtube.com/playlist?list=PLtest123"}"#,
+        );
+        let entries = parse_entries(input);
+        let mut mixes = Vec::new();
+        let mut playlists = Vec::new();
+        for e in entries {
+            match e.playlist_type {
+                PlaylistType::Mix => mixes.push(e),
+                _ => playlists.push(e),
+            }
+        }
+        assert_eq!(mixes.len(), 2);
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(mixes[0].id, "RDCLAK5uy_abc");
+        assert_eq!(mixes[1].id, "RDAMPL_xyz");
+        assert_eq!(playlists[0].id, "PLtest123");
+    }
+
+    #[test]
+    fn library_playlists_empty_when_only_system_playlists() {
+        const SKIP_IDS: &[&str] = &["WL", "LL", "LM", "HL"];
+        let input = concat!(
+            r#"{"_type":"url","id":"WL","title":"Watch later","url":"https://www.youtube.com/playlist?list=WL"}"#,
+            "\n",
+            r#"{"_type":"url","id":"LL","title":"Liked videos","url":"https://www.youtube.com/playlist?list=LL"}"#,
+            "\n",
+            r#"{"_type":"url","id":"LM","title":"Liked Music","url":"https://www.youtube.com/playlist?list=LM"}"#,
+            "\n",
+            r#"{"_type":"url","id":"HL","title":"History","url":"https://www.youtube.com/playlist?list=HL"}"#,
+        );
+        let entries = parse_entries(input)
+            .into_iter()
+            .filter(|p| !SKIP_IDS.contains(&p.id.as_str()))
+            .collect::<Vec<_>>();
+        assert!(entries.is_empty());
+    }
+
     // -- CacheStore integration with FeedSection --
 
     #[test]
@@ -851,21 +987,21 @@ mod tests {
         let store: CacheStore<Vec<FeedSection>> = CacheStore::new(
             tmp.path().join("feed_cache.json"),
             Duration::from_secs(3600),
-            1,
+            2, // current schema version
         );
 
         let sections = vec![
-            make_section("My Mixes", PlaylistType::Mix, 2),
-            make_section("Library", PlaylistType::LibrarySaved, 1),
+            make_section("Saved Mixes", PlaylistType::Mix, 2),
+            make_section("My Playlists", PlaylistType::LibrarySaved, 1),
         ];
 
         store.save(&sections).unwrap();
         let loaded = store.load().unwrap().unwrap();
 
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].title, "My Mixes");
+        assert_eq!(loaded[0].title, "Saved Mixes");
         assert_eq!(loaded[0].items.len(), 2);
-        assert_eq!(loaded[1].title, "Library");
+        assert_eq!(loaded[1].title, "My Playlists");
     }
 
     #[test]
@@ -898,22 +1034,22 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
 
-        // Save with schema version 1
-        let store_v1: CacheStore<Vec<FeedSection>> = CacheStore::new(
-            tmp.path().join("feed_cache.json"),
-            Duration::from_secs(3600),
-            1,
-        );
-        store_v1
-            .save(&vec![make_section("My Mixes", PlaylistType::Mix, 1)])
-            .unwrap();
-
-        // Load with schema version 2 — should be a miss
+        // Save with current schema version
         let store_v2: CacheStore<Vec<FeedSection>> = CacheStore::new(
             tmp.path().join("feed_cache.json"),
             Duration::from_secs(3600),
             2,
         );
-        assert!(store_v2.load().unwrap().is_none());
+        store_v2
+            .save(&vec![make_section("Saved Mixes", PlaylistType::Mix, 1)])
+            .unwrap();
+
+        // Load with a future schema version — should be a miss
+        let store_v3: CacheStore<Vec<FeedSection>> = CacheStore::new(
+            tmp.path().join("feed_cache.json"),
+            Duration::from_secs(3600),
+            3,
+        );
+        assert!(store_v3.load().unwrap().is_none());
     }
 }
