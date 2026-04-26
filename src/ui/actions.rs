@@ -24,11 +24,16 @@ impl MusicPlayerApp {
     /// callers are responsible for calling `trigger_smart_downloads()`.
     /// Returns the set of video IDs currently in the queue (for deduplication).
     fn queued_video_ids(&self) -> std::collections::HashSet<String> {
-        self.queue
+        let mut ids: std::collections::HashSet<String> = self.queue
             .get_queue_list()
             .iter()
             .map(|t| t.video_id.clone())
-            .collect()
+            .collect();
+        // Also include the currently-playing track so it isn't re-added as a duplicate.
+        if let Some(current) = self.queue.get_current() {
+            ids.insert(current.video_id.clone());
+        }
+        ids
     }
 
     /// Add tracks to the queue, skipping:

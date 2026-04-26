@@ -293,7 +293,8 @@ pub(crate) fn fetch_tracks_for_playlist(
         };
 
         let video_id = json["id"].as_str().unwrap_or("").to_string();
-        if video_id.is_empty() {
+        // Validate video ID format — consistent with playlist.rs and extractor.rs.
+        if !crate::youtube::extractor::is_valid_video_id(&video_id) {
             continue;
         }
 
