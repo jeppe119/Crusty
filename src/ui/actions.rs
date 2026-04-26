@@ -402,12 +402,16 @@ impl MusicPlayerApp {
                 }
             }
             FeedFocus::Playlists => {
+                // j navigates items within the selected section.
                 let Some(section) = self.feed.sections.get(self.feed.selected_section) else {
                     return;
                 };
                 let max = section.items.len().saturating_sub(1);
                 if self.feed.selected_item < max {
                     self.feed.selected_item += 1;
+                } else {
+                    // At the bottom of the section — move to the next section.
+                    self.feed_next_section_tab();
                 }
             }
         }
@@ -420,19 +424,40 @@ impl MusicPlayerApp {
                 self.feed.selected_track = self.feed.selected_track.saturating_sub(1);
             }
             FeedFocus::Playlists => {
-                self.feed.selected_item = self.feed.selected_item.saturating_sub(1);
+                // k navigates items within the selected section.
+                if self.feed.selected_item > 0 {
+                    self.feed.selected_item -= 1;
+                } else {
+                    // At the top of the section — move to the previous section.
+                    self.feed_prev_section_tab();
+                }
             }
         }
     }
 
     pub(super) fn feed_next_section(&mut self) {
         use crate::ui::state::FeedFocus;
-        // If in track view, h/l collapses back to playlist view
+        // l / → : collapse track view → playlist view (go left),
+        // or when already in playlist view, do nothing (Enter expands).
         if self.feed.focus == FeedFocus::Tracks {
             self.feed.focus = FeedFocus::Playlists;
             self.feed.expanded_tracks.clear();
-            return;
         }
+        // In Playlists focus, l/→ is a no-op — use Enter to expand into tracks.
+    }
+
+    pub(super) fn feed_prev_section(&mut self) {
+        use crate::ui::state::FeedFocus;
+        // h / ← : collapse track view → playlist view (go left).
+        if self.feed.focus == FeedFocus::Tracks {
+            self.feed.focus = FeedFocus::Playlists;
+            self.feed.expanded_tracks.clear();
+        }
+        // In Playlists focus, h/← is a no-op — use j/k to move between sections.
+    }
+
+    pub(super) fn feed_next_section_tab(&mut self) {
+        // Move to the next section in the left column (j navigates down).
         if !self.feed.sections.is_empty() {
             let max = self.feed.sections.len() - 1;
             if self.feed.selected_section < max {
@@ -442,13 +467,8 @@ impl MusicPlayerApp {
         }
     }
 
-    pub(super) fn feed_prev_section(&mut self) {
-        use crate::ui::state::FeedFocus;
-        if self.feed.focus == FeedFocus::Tracks {
-            self.feed.focus = FeedFocus::Playlists;
-            self.feed.expanded_tracks.clear();
-            return;
-        }
+    pub(super) fn feed_prev_section_tab(&mut self) {
+        // Move to the previous section in the left column (k navigates up).
         if self.feed.selected_section > 0 {
             self.feed.selected_section -= 1;
             self.feed.selected_item = 0;

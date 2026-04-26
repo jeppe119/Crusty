@@ -533,7 +533,7 @@ impl MusicPlayerApp {
                 AppMode::AccountPicker => "Select YouTube Account".to_string(),
                 AppMode::Help => "Help - Press '?', 'Esc', or 'q' to close".to_string(),
                 AppMode::FeedBrowser => {
-                    "Feed Browser - [j/k] Navigate  [h/l] Sections  [Enter] Play  [a] Add  [r] Refresh  [Esc/f] Close".to_string()
+                    "Feed Browser - [j/k] Navigate  [h/l] Expand/Collapse  [Enter] Play  [a] Add  [r] Refresh  [Esc/f] Close".to_string()
                 }
             }
         };

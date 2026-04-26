@@ -129,8 +129,12 @@ pub(crate) fn key_to_command(key: KeyEvent, ctx: &InputContext<'_>) -> Option<Ap
             KeyCode::Char('?') => Some(AppCommand::ShowHelp),
             KeyCode::Char('f') | KeyCode::Esc => Some(AppCommand::CloseFeedBrowser),
             KeyCode::Char('r') | KeyCode::Char('R') => Some(AppCommand::RefreshFeed),
+            // j/k — navigate vertically: sections in left column, items in middle, tracks on right
             KeyCode::Char('j') | KeyCode::Down => Some(AppCommand::FeedNavigateDown),
             KeyCode::Char('k') | KeyCode::Up => Some(AppCommand::FeedNavigateUp),
+            // h/l — move horizontally between columns:
+            //   l / → : expand selected playlist into track view (go right)
+            //   h / ← : collapse track view back to playlist view (go left)
             KeyCode::Char('l') | KeyCode::Right => Some(AppCommand::FeedNextSection),
             KeyCode::Char('h') | KeyCode::Left => Some(AppCommand::FeedPrevSection),
             KeyCode::Enter => Some(AppCommand::FeedPlayNow),
