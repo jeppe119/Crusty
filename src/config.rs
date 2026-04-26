@@ -7,8 +7,9 @@ use anyhow::Context;
 /// Application name used for config directory and display.
 pub(crate) const APP_NAME: &str = "youtube-music-player";
 
-/// Maximum track duration in seconds (5 minutes). Tracks longer than this are filtered out.
-pub(crate) const MAX_TRACK_DURATION_SECS: u64 = 300;
+/// Maximum track duration in seconds (7 minutes). Tracks longer than this are filtered out
+/// in music-only mode (Shift+F). Raised from 5 min to accommodate longer rock tracks.
+pub(crate) const MAX_TRACK_DURATION_SECS: u64 = 420;
 
 /// Maximum length for user search queries.
 pub(crate) const MAX_SEARCH_QUERY_LEN: usize = 500;
