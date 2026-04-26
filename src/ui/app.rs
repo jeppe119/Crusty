@@ -312,8 +312,11 @@ impl MusicPlayerApp {
             if now.duration_since(self.ui.last_animation_update) >= animation_interval {
                 self.ui.animation_frame = self.ui.animation_frame.wrapping_add(1);
 
-                // Scroll title text slowly for readability
-                self.ui.title_scroll_offset = self.ui.title_scroll_offset.wrapping_add(1);
+                // Scroll controls text — advance one character every 4 animation frames
+                // (~600ms per char at 150ms/frame) for comfortable reading speed.
+                if self.ui.animation_frame % 4 == 0 {
+                    self.ui.title_scroll_offset = self.ui.title_scroll_offset.wrapping_add(1);
+                }
 
                 self.ui.last_animation_update = now;
             }
