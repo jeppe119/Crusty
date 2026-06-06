@@ -13,4 +13,9 @@ dirs = "5.0"
 tempfile = "3.10"
 tokio = { version = "1.35", features = ["rt", "sync", "macros"] }
 
+# Audio playback (engine module)
+rodio = "0.22"
+# Lock-free command channel: Sender is Send + Sync, recv_timeout drives the loop
+crossbeam-channel = "0.5"
+
 [dev-dependencies]

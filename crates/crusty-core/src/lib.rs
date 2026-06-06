@@ -15,11 +15,13 @@
 
 pub mod config;
 pub mod download;
+pub mod engine;
 pub mod model;
 pub mod persistence;
 pub mod queue;
 
 pub use download::{DownloadManager, DownloadResult};
+pub use engine::{AudioCommand, AudioEngine, AudioEvent, PlayerSnapshot};
 pub use model::{PersistedQueue, PlayerState, Track};
 pub use persistence::{PersistenceService, PlaybackState};
 pub use queue::Queue;
