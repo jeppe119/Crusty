@@ -1,0 +1,10 @@
+[package]
+name = "crusty-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Newid"]
+description = "Framework-agnostic core for Crusty: audio engine, queue, downloads, config/state"
+
+[dependencies]
+
+[dev-dependencies]
