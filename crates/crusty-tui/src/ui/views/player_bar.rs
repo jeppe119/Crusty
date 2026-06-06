@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use crate::config::{clean_title, format_time};
-use crate::player::audio::PlayerState;
+use crusty_core::PlayerState;
 
 use super::super::app::MusicPlayerApp;
 
@@ -62,8 +62,8 @@ pub(crate) fn draw_player_compact(app: &MusicPlayerApp, frame: &mut Frame, area:
     };
 
     // Line 2: Progress bar with bouncing visualization
-    let time_pos = app.player.get_time_pos();
-    let player_duration = app.player.get_duration();
+    let time_pos = app.snapshot.position_secs;
+    let player_duration = app.snapshot.duration_secs;
 
     // ALWAYS prefer player duration (from actual audio) over track.duration (often 0 from flat-playlist)
     // Also use track.duration as last resort if available and > 0
@@ -80,7 +80,7 @@ pub(crate) fn draw_player_compact(app: &MusicPlayerApp, frame: &mut Frame, area:
     };
 
     // Bouncy bars + timer progress bar
-    let progress_bar = if app.player.get_state() == PlayerState::Playing {
+    let progress_bar = if app.snapshot.state == PlayerState::Playing {
         // Bouncing bars animation
         let anim_frame = (app.ui.animation_frame / 4) % 8;
         let bars = match anim_frame {
@@ -116,14 +116,14 @@ pub(crate) fn draw_player_compact(app: &MusicPlayerApp, frame: &mut Frame, area:
     };
 
     // Line 3: Status info
-    let state_str = match app.player.get_state() {
+    let state_str = match app.snapshot.state {
         PlayerState::Playing => "▶ Playing",
         PlayerState::Paused => "⏸ Paused",
         PlayerState::Stopped => "⏹ Stopped",
         PlayerState::Loading => "... Loading",
     };
 
-    let volume = app.player.get_volume();
+    let volume = app.snapshot.volume;
     let mode_str = if app.ui.music_only_mode {
         "Music"
     } else {

@@ -3,8 +3,8 @@
 //! Handles play/pause/seek/volume and the centralized cache-or-download logic.
 
 use crate::config::{format_time, is_allowed_youtube_url, LOOKAHEAD_DOWNLOAD_COUNT};
-use crate::player::audio::PlayerState;
 use crate::player::queue::Track;
+use crusty_core::PlayerState;
 use crate::services::persistence::MAX_HISTORY_SIZE;
 
 use super::app::MusicPlayerApp;
@@ -47,8 +47,8 @@ impl MusicPlayerApp {
 
         if let Some(local_file) = cached_file {
             if std::path::Path::new(&local_file).exists() {
-                self.player
-                    .play_with_duration(&local_file, &track.title, track.duration as f64);
+                self.engine
+                    .play(local_file, track.title.clone(), track.duration as f64);
                 self.status_message.clear();
                 let next = self.queue.get_queue_slice(0, LOOKAHEAD_DOWNLOAD_COUNT);
                 self.downloads
@@ -95,14 +95,14 @@ impl MusicPlayerApp {
         } else if self.queue.get_current().is_none() && !self.queue.is_empty() {
             // Nothing playing but queue has tracks - START PLAYING!
             self.play_current_or_first().await;
-        } else if self.player.get_state() == PlayerState::Stopped
+        } else if self.snapshot.state == PlayerState::Stopped
             && self.queue.get_current().is_some()
         {
             // Player stopped but track exists in queue - RELOAD IT!
             self.play_current_or_first().await;
         } else {
             // Normal pause/resume
-            self.player.toggle_pause();
+            self.engine.toggle_pause();
         }
     }
 
@@ -161,31 +161,35 @@ impl MusicPlayerApp {
     }
 
     pub(super) fn volume_up(&mut self, has_shift: bool) {
-        let current = self.player.get_volume();
+        let current = self.snapshot.volume;
         let increment = if has_shift { 5 } else { 1 };
         if current < 100 {
-            self.player.set_volume((current + increment).min(100));
+            let new_volume = (current + increment).min(100);
+            self.engine.set_volume(new_volume);
+            self.snapshot.volume = new_volume;
         }
     }
 
     pub(super) fn volume_down(&mut self, has_shift: bool) {
-        let current = self.player.get_volume();
+        let current = self.snapshot.volume;
         let decrement = if has_shift { 5 } else { 1 };
         if current > 0 {
-            self.player.set_volume(current.saturating_sub(decrement));
+            let new_volume = current.saturating_sub(decrement);
+            self.engine.set_volume(new_volume);
+            self.snapshot.volume = new_volume;
         }
     }
 
     pub(super) fn seek_forward(&mut self) {
-        self.player.seek_relative(10.0);
-        self.player.apply_seek();
-        self.set_status(format!("Seeked +10s ({})", format_time(self.player.get_time_pos())));
+        self.engine.seek_relative(10.0);
+        let pos = self.snapshot.position_secs + 10.0;
+        self.set_status(format!("Seeked +10s ({})", format_time(pos)));
     }
 
     pub(super) fn seek_backward(&mut self) {
-        self.player.seek_relative(-10.0);
-        self.player.apply_seek();
-        self.set_status(format!("Seeked -10s ({})", format_time(self.player.get_time_pos())));
+        self.engine.seek_relative(-10.0);
+        let pos = (self.snapshot.position_secs - 10.0).max(0.0);
+        self.set_status(format!("Seeked -10s ({})", format_time(pos)));
     }
 
     /// Resume playback from saved state if a matching cached file exists.
@@ -195,7 +199,8 @@ impl MusicPlayerApp {
         };
 
         // Always restore volume, even if track can't be resumed
-        self.player.set_volume(saved.volume);
+        self.engine.set_volume(saved.volume);
+        self.snapshot.volume = saved.volume;
 
         // If no track was playing, just restore volume
         if saved.video_id.is_empty() {
@@ -213,13 +218,12 @@ impl MusicPlayerApp {
         }
 
         // Play the track from cache
-        self.player
-            .play_with_duration(&file_path, &saved.title, saved.duration);
+        self.engine
+            .play(file_path, saved.title.clone(), saved.duration);
 
         // Seek to the saved position
         if saved.position_secs > 1.0 {
-            self.player.seek(saved.position_secs);
-            self.player.apply_seek();
+            self.engine.seek_to(saved.position_secs);
         }
 
         self.status_message = format!(

@@ -14,11 +14,11 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::config::{is_allowed_youtube_url, LOOKAHEAD_DOWNLOAD_COUNT, STARTUP_DOWNLOAD_COUNT};
-use crate::player::audio::{AudioPlayer, PlayerState};
 use crate::player::queue::{Queue, Track};
+use crusty_core::{AudioEngine, AudioEvent, PlayerSnapshot, PlayerState};
 use crate::services::download::DownloadManager;
 use crate::services::persistence::PersistenceService;
 use crate::ui::state::{AppMode, FeedSection, FeedState, PlaylistState, QueueState, SearchState, UiState, ViewMode};
@@ -46,7 +46,11 @@ fn scroll_text(text: &str, offset: usize) -> String {
 
 pub struct MusicPlayerApp {
     // Core modules
-    pub(crate) player: AudioPlayer,
+    pub(crate) engine: AudioEngine,
+    /// One-shot playback events (TrackEnded/LoadError/DeviceUnavailable) from the engine.
+    engine_events: broadcast::Receiver<AudioEvent>,
+    /// Latest engine state, refreshed once per frame so views read a consistent snapshot.
+    pub(crate) snapshot: PlayerSnapshot,
     pub(crate) queue: Queue,
     pub(crate) browser_auth: BrowserAuth,
     pub(crate) available_accounts: Vec<BrowserAccount>,
@@ -127,8 +131,13 @@ impl MusicPlayerApp {
         let download_cache = persistence.load_download_cache();
         let cache_count = download_cache.len();
 
+        let engine = AudioEngine::new();
+        let engine_events = engine.subscribe_events();
+
         Ok(MusicPlayerApp {
-            player: AudioPlayer::new(),
+            engine,
+            engine_events,
+            snapshot: PlayerSnapshot::default(),
             queue,
             browser_auth,
             available_accounts: Vec::new(),
@@ -297,6 +306,10 @@ impl MusicPlayerApp {
                 self.try_resume_playback();
             }
 
+            // Refresh the cached engine snapshot once per iteration so all views
+            // and logic read a single, consistent view of playback state.
+            self.snapshot = self.engine.snapshot();
+
             // Only render if enough time has passed (frame rate limiting)
             let now = std::time::Instant::now();
             let should_render = now.duration_since(last_render) >= frame_duration;
@@ -382,9 +395,9 @@ impl MusicPlayerApp {
                         if let Some(track) = &self.pending_play_track {
                             if track.video_id == video_id {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                self.player.play_with_duration(
-                                    &temp_file_path,
-                                    &track.title,
+                                self.engine.play(
+                                    temp_file_path.clone(),
+                                    track.title.clone(),
                                     track.duration as f64,
                                 );
                                 self.status_message.clear();
@@ -444,17 +457,41 @@ impl MusicPlayerApp {
                     .save_download_cache(&self.downloads.get_cache_snapshot());
             }
 
-            // Auto-advance to next track when current finishes
-            // IMPORTANT: Only auto-advance when state is Playing (not Loading, Stopped, or Paused)
-            // This prevents race condition where sink is empty during track loading
-            if self.player.is_finished() && self.player.get_state() == PlayerState::Playing {
+            // Drain one-shot engine events. The engine emits TrackEnded exactly
+            // once per natural finish (with its own 2s guard + Playing-state check),
+            // so we no longer poll is_finished() each frame.
+            let mut track_ended = false;
+            loop {
+                match self.engine_events.try_recv() {
+                    Ok(AudioEvent::TrackEnded) => track_ended = true,
+                    Ok(AudioEvent::LoadError(msg)) => {
+                        self.status_message = format!("❌ Playback error: {}", msg);
+                    }
+                    Ok(AudioEvent::DeviceUnavailable) => {
+                        self.status_message =
+                            "⚠ No audio device available — playback disabled".to_string();
+                    }
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                        // Missed events under load — fall back to the snapshot:
+                        // a Stopped state while a track is current implies it ended.
+                        if self.snapshot.state == PlayerState::Stopped
+                            && self.queue.get_current().is_some()
+                        {
+                            track_ended = true;
+                        }
+                    }
+                    Err(_) => break, // Empty or Closed
+                }
+            }
+
+            if track_ended {
                 // Track finished naturally — clear saved resume state
                 self.persistence.clear_playback_state();
                 if !self.queue.is_empty() {
                     self.status_message = "Track finished, playing next...".to_string();
                     self.play_next().await;
                 } else {
-                    self.player.stop();
+                    self.engine.stop();
                     self.status_message = "Playback finished - queue is empty".to_string();
                 }
             }
@@ -480,12 +517,15 @@ impl MusicPlayerApp {
         self.downloads.abort_all();
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
+        // Read a final engine snapshot BEFORE shutting the engine down.
+        let final_snapshot = self.engine.snapshot();
+        let volume = final_snapshot.volume;
+
         // Save playback state (position + volume) for resume-on-restart
-        let volume = self.player.get_volume();
         if let Some(current) = self.queue.get_current() {
             let state = crate::services::persistence::PlaybackState {
                 video_id: current.video_id.clone(),
-                position_secs: self.player.get_time_pos(),
+                position_secs: final_snapshot.position_secs,
                 title: current.title.clone(),
                 duration: current.duration as f64,
                 volume,
@@ -502,6 +542,10 @@ impl MusicPlayerApp {
             };
             let _ = self.persistence.save_playback_state(&state);
         }
+
+        // Stop audio output now; the engine thread is joined when the engine is
+        // dropped (Drop sends Shutdown + joins).
+        self.engine.stop();
 
         // Save history, queue, and download cache before quitting
         if let Err(e) = self.save_history() {
