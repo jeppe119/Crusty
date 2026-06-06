@@ -1,0 +1,24 @@
+# Crusty matugen templates — merge these [templates.*] entries into your
+# ~/.config/matugen/config.toml. Adjust `input_path` to wherever you cloned the
+# Crusty repo (paths below assume ~/Development/Crusty).
+
+# 1) GUI theme (CSS custom properties) consumed by the Tauri/Svelte GUI.
+#    The GUI watches this file and re-themes live (no restart).
+[templates.crusty_gui]
+input_path  = '~/Development/Crusty/themes/matugen/crusty-gui.css'
+output_path = '~/.config/crusty/theme.css'
+
+# 2) Quickshell colours (JSON) consumed by the Crusty Colors.qml singleton.
+#    Quickshell's FileView watches this file and hot-reloads (no restart).
+[templates.crusty_quickshell]
+input_path  = '~/Development/Crusty/themes/matugen/crusty-quickshell.json'
+output_path = '~/.cache/matugen/crusty-colors.json'
+
+# Regenerate everything (and set the wallpaper) with:
+#   matugen image ~/wallpapers/current.jpg            # follows --mode or detects
+#   matugen image ~/wallpapers/current.jpg -m dark    # force dark
+#   matugen image ~/wallpapers/current.jpg -m light   # force light
+#
+# Neither template needs a post_hook: the GUI and Quickshell both watch their
+# output files. If you ALSO theme Waybar from matugen, that template can keep its
+# own `post_hook = 'pkill -SIGUSR2 waybar &'` to reload the bar.

@@ -85,16 +85,56 @@ Config dir: `~/.config/youtube-music-player/` (`APP_NAME` is **frozen**). Files:
 `#[serde(default)]` fields. `PlaybackState.volume` already uses `#[serde(default)]`
 (→ 100) for forward/backward compat.
 
+## MPRIS2 control surface (`crusty_core::mpris`, `mpris` feature)
+
+Crusty registers `org.mpris.MediaPlayer2.crusty` on the session bus, giving
+**Waybar** (`mpris` module), **Quickshell** (`Quickshell.Services.Mpris`), and
+**`playerctl -p crusty`** display + control — with no GUI required (it runs in the
+TUI process today, and the GUI will reuse it).
+
+- **`EngineController`** (`Clone + Send + Sync`): the bridge's view of the engine
+  (command sender + snapshot receiver) — `AudioEngine` itself isn't `Clone`
+  (it owns the thread `JoinHandle`). Get one via `AudioEngine::controller()`.
+- **`mpris::mapping`** — pure, unit-tested snapshot↔MPRIS conversions
+  (`PlaybackStatus`, microsecond `Time`, volume, `build_metadata`, synthesized
+  `mpris:trackid` as `/org/mpris/MediaPlayer2/crusty/track/{n}` — digits only, so
+  always a valid object path despite YouTube IDs containing `-`/`_`).
+- **`mpris::server`** — `CrustyMpris` implements `RootInterface` + `PlayerInterface`
+  using the regular `Server<T>` (the handle is `Send + Sync`, so no `LocalServer`/
+  `spawn_local`). `serve_mpris()` diffs the snapshot stream and emits
+  `PropertiesChanged` **only on change** (no spam at the 150ms tick). Per the spec,
+  `Position` is not in `PropertiesChanged`; emit `Seeked` after MPRIS-initiated seeks.
+- **`MprisAction`** — queue navigation (`Next`/`Previous`), `PlayPause` (start-when-
+  stopped), `Stop`, `Quit` live in the *host*, not the engine, so the bridge forwards
+  them over an `mpsc` channel. The host maps each to the **same** method its
+  keybindings use ⇒ external control == keyboard.
+- **Feature flag:** `mpris` (default-on in `crusty-tui`). `--no-default-features`
+  builds without D-Bus; `serve_mpris` errors (no session bus) are logged + swallowed.
+
+## Theming — matugen (`themes/matugen/`)
+
+Material You dynamic colour from the wallpaper, via [matugen](https://github.com/InioX/matugen).
+One `matugen image …` run themes both front-ends:
+- `crusty-gui.css` (template) → `~/.config/crusty/theme.css` → GUI CSS custom
+  properties (`--md-sys-color-*`), consumed by Tailwind v4 `@theme`, hot-reloaded
+  via `@tauri-apps/plugin-fs` `watch()`.
+- `crusty-quickshell.json` (template) → `~/.cache/matugen/crusty-colors.json`,
+  loaded by the shipped `quickshell/Colors.qml` singleton (`FileView` +
+  `JsonAdapter`, hot-reloads natively, ships Material-dark defaults).
+See `themes/matugen/README.md`.
+
 ## Future integration points (not yet built)
-- **Tauri GUI:** put `AudioEngine` in Tauri managed `State`; `#[tauri::command]`s
-  call the engine methods; drive `app.emit` from `subscribe()`/`subscribe_events()`.
+- **Tauri GUI (`crates/crusty-gui`):** put `AudioEngine` in Tauri managed `State`;
+  `#[tauri::command]`s call the engine; drive `app.emit` from `subscribe()`/
+  `subscribe_events()`; reuse the Phase-1 MPRIS bridge (`serve_mpris(..., can_raise=true)`).
   Close-to-tray = `WindowEvent::CloseRequested` → `prevent_close()` + `window.hide()`;
   restore via a tray **right-click menu** item (Linux libappindicator does not fire
-  tray left-click). Tray appears in Waybar's `tray` (SNI) module.
-- **MPRIS2 (`mpris-server`/zbus):** own a `subscribe_events()` receiver + a
-  `subscribe()` watch; map `AudioEvent`/`PlayerSnapshot` → MPRIS signals
-  (`PropertiesChanged`, `Seeked`). Bus name `org.mpris.MediaPlayer2.crusty`.
-  Add `Track.album`/`artwork` via `#[serde(default)]` when needed. Works with the
-  Waybar `mpris` module + `playerctl -p crusty`.
+  tray left-click). Tray appears in Waybar's `tray` (SNI) module. Consumes the
+  matugen CSS above.
+- **`crates/crusty-yt` (prerequisite for the GUI):** the YouTube search/feed/
+  playlist/auth logic currently lives in `crusty-tui` (`youtube/*`, `services/feed.rs`,
+  `services/playlist.rs`). The GUI can't search/play without it, so it must be
+  extracted into a shared crate (depends on `crusty-core` for `Track`; no
+  `ratatui`/`tauri`) before the GUI search UI is built.
 
 See `CRUSTY_CORE_EXTRACTION_PLAN.md` for the phased history of this refactor.
