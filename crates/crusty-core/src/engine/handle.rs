@@ -61,17 +61,29 @@ fn compute_position(
 
 /// Clamp an absolute seek target into the valid range.
 ///
-/// Negative targets clamp to `0.0`. When `duration > 0.0`, targets beyond the
-/// duration clamp to `duration`; when duration is unknown (`<= 0.0`) no upper
-/// bound is applied.
+/// Non-finite targets (`NaN`/`±inf`) and negative targets clamp to `0.0`. When
+/// `duration > 0.0`, targets beyond the duration clamp to `duration`; when
+/// duration is unknown (`<= 0.0`) no upper bound is applied.
 fn clamp_seek(target: f64, duration: f64) -> f64 {
-    if target < 0.0 {
+    if !target.is_finite() || target < 0.0 {
         0.0
     } else if duration > 0.0 && target > duration {
         duration
     } else {
         target
     }
+}
+
+/// Compute the `start_time` baseline for a seek to `target` seconds, accounting
+/// for accumulated paused time.
+///
+/// Uses checked subtraction so it never panics: near system boot (monotonic
+/// clock close to zero) or for very large targets the subtraction would
+/// underflow `Instant`, in which case we fall back to "now" (position ~0).
+fn seek_baseline(now: Instant, target: Duration, total_paused: Duration) -> Instant {
+    now.checked_sub(target)
+        .and_then(|t| t.checked_sub(total_paused))
+        .unwrap_or(now)
 }
 
 /// Open and decode an audio file, returning a rodio decoder or an error string.
@@ -181,8 +193,11 @@ impl Engine {
             .is_some_and(|p| p.try_seek(target_dur).is_ok());
 
         if native_ok {
-            self.start_time =
-                Some(Instant::now() - target_dur - self.total_paused_duration);
+            self.start_time = Some(seek_baseline(
+                Instant::now(),
+                target_dur,
+                self.total_paused_duration,
+            ));
             return;
         }
 
@@ -194,8 +209,11 @@ impl Engine {
             if let Some(p) = &self.player {
                 let _ = p.try_seek(target_dur);
             }
-            self.start_time =
-                Some(Instant::now() - target_dur - self.total_paused_duration);
+            self.start_time = Some(seek_baseline(
+                Instant::now(),
+                target_dur,
+                self.total_paused_duration,
+            ));
         }
         // Otherwise (headless / nothing loaded): no-op, no panic.
     }
@@ -537,6 +555,37 @@ mod tests {
         assert_eq!(clamp_seek(-1.0, 0.0), 0.0);
     }
 
+    #[test]
+    fn clamp_seek_rejects_non_finite() {
+        // All non-finite inputs clamp to 0.0 (safe, never panics downstream).
+        assert_eq!(clamp_seek(f64::NAN, 100.0), 0.0);
+        assert_eq!(clamp_seek(f64::INFINITY, 100.0), 0.0);
+        assert_eq!(clamp_seek(f64::INFINITY, 0.0), 0.0);
+        assert_eq!(clamp_seek(f64::NEG_INFINITY, 100.0), 0.0);
+    }
+
+    // ---- pure helper: seek_baseline (never panics on underflow) ----
+
+    #[test]
+    fn seek_baseline_normal_case() {
+        let now = Instant::now();
+        // A modest target well within the monotonic clock's range.
+        let base = seek_baseline(now, Duration::from_secs(5), Duration::ZERO);
+        let pos = compute_position(Some(base), None, Duration::ZERO, now);
+        assert!((pos - 5.0).abs() < 0.01, "pos = {pos}");
+    }
+
+    #[test]
+    fn seek_baseline_huge_target_does_not_panic() {
+        let now = Instant::now();
+        // A target far exceeding the monotonic clock's elapsed time would
+        // underflow `Instant - Duration`; seek_baseline must clamp to `now`.
+        let base = seek_baseline(now, Duration::from_secs(u32::MAX as u64), Duration::ZERO);
+        // Falling back to `now` yields position ~0, never a panic.
+        let pos = compute_position(Some(base), None, Duration::ZERO, now);
+        assert!(pos >= 0.0);
+    }
+
     // ---- pure helper: compute_position ----
 
     #[test]
@@ -637,6 +686,23 @@ mod tests {
         assert!(wait_until(&rx, Duration::from_millis(400), |s| {
             s.position_secs >= 0.0
         }));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn huge_seek_does_not_kill_engine_thread() {
+        // Regression: `Instant - Duration` underflow on a large seek target with
+        // unknown duration must NOT panic the engine thread. The engine must keep
+        // processing commands + publishing snapshots afterwards.
+        let engine = AudioEngine::new();
+        engine.seek_to(1_000_000_000.0); // ~31 years; would underflow naive arithmetic
+        engine.seek_to(f64::NAN); // also must not panic
+        engine.set_volume(77);
+        let rx = engine.subscribe();
+        assert!(
+            wait_until(&rx, Duration::from_secs(2), |s| s.volume == 77),
+            "engine thread died after a huge/NaN seek (volume command never applied)"
+        );
         engine.shutdown();
     }
 

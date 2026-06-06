@@ -68,6 +68,15 @@ pub struct Queue {
 // ==========================================
 // QUEUE IMPLEMENTATION
 // ==========================================
+impl Default for Queue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// `next`/`previous` are domain queue-navigation methods, not iterator methods;
+// the naming is intentional and part of the public API.
+#[allow(clippy::should_implement_trait)]
 impl Queue {
     // ==========================================
     // CONSTRUCTOR: new()
