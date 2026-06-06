@@ -9,9 +9,11 @@
 //! See `CRUSTY_CORE_EXTRACTION_PLAN.md` (Phase D) for the design rationale.
 
 mod command;
+mod controller;
 mod handle;
 mod snapshot;
 
 pub use command::AudioCommand;
+pub use controller::EngineController;
 pub use handle::AudioEngine;
 pub use snapshot::{AudioEvent, PlayerSnapshot};

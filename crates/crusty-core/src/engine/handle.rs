@@ -107,6 +107,7 @@ struct Engine {
     volume: u32,
     duration: f64,
     current_title: String,
+    current_artist: String,
     start_time: Option<Instant>,
     pause_time: Option<Instant>,
     total_paused_duration: Duration,
@@ -130,7 +131,7 @@ impl Engine {
 
     /// Port of `play_with_duration`: stop, decode (panic-guarded), append, and
     /// reset the wall-clock. On failure emit `LoadError` and return to Stopped.
-    fn load_and_play(&mut self, path: PathBuf, title: String, duration_secs: f64) {
+    fn load_and_play(&mut self, path: PathBuf, title: String, artist: String, duration_secs: f64) {
         if self.player.is_none() {
             // Headless: nothing to play. Snapshot stays Stopped.
             return;
@@ -166,6 +167,7 @@ impl Engine {
             Ok(()) => {
                 self.state = PlayerState::Playing;
                 self.current_title = title;
+                self.current_artist = artist;
                 self.duration = if duration_secs > 0.0 { duration_secs } else { 0.0 };
                 self.start_time = Some(Instant::now());
                 self.pause_time = None;
@@ -204,8 +206,9 @@ impl Engine {
         // Fallback: reload the file and seek forward from zero.
         if let Some(file_path) = self.current_file_path.clone() {
             let title = self.current_title.clone();
+            let artist = self.current_artist.clone();
             let duration = self.duration;
-            self.load_and_play(PathBuf::from(&file_path), title, duration);
+            self.load_and_play(PathBuf::from(&file_path), title, artist, duration);
             if let Some(p) = &self.player {
                 let _ = p.try_seek(target_dur);
             }
@@ -306,6 +309,7 @@ impl Engine {
             duration_secs: self.duration,
             volume: self.volume,
             title: self.current_title.clone(),
+            artist: self.current_artist.clone(),
         };
         self.snapshot_tx.send_replace(snapshot);
     }
@@ -318,8 +322,9 @@ impl Engine {
                     AudioCommand::Play {
                         path,
                         title,
+                        artist,
                         duration_secs,
-                    } => self.load_and_play(path, title, duration_secs),
+                    } => self.load_and_play(path, title, artist, duration_secs),
                     AudioCommand::Pause => self.pause(),
                     AudioCommand::Resume => self.resume(),
                     AudioCommand::TogglePause => self.toggle(),
@@ -399,6 +404,7 @@ impl AudioEngine {
                     volume: 100,
                     duration: 0.0,
                     current_title: String::new(),
+                    current_artist: String::new(),
                     start_time: None,
                     pause_time: None,
                     total_paused_duration: Duration::ZERO,
@@ -431,11 +437,13 @@ impl AudioEngine {
         &self,
         path: impl Into<PathBuf>,
         title: impl Into<String>,
+        artist: impl Into<String>,
         duration_secs: f64,
     ) {
         self.send(AudioCommand::Play {
             path: path.into(),
             title: title.into(),
+            artist: artist.into(),
             duration_secs,
         });
     }
@@ -485,6 +493,14 @@ impl AudioEngine {
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<PlayerSnapshot> {
         self.snapshot_rx.clone()
+    }
+
+    /// Obtain a cheap, cloneable [`EngineController`] for spawned tasks (MPRIS,
+    /// Tauri commands) that need to drive and observe the engine without owning
+    /// its thread lifecycle.
+    #[must_use]
+    pub fn controller(&self) -> super::controller::EngineController {
+        super::controller::EngineController::new(self.cmd_tx.clone(), self.snapshot_rx.clone())
     }
 
     /// Obtain a `broadcast::Receiver` for one-shot [`AudioEvent`]s. Each
@@ -736,7 +752,7 @@ mod tests {
     #[test]
     fn default_and_typed_helpers_enqueue_without_panic() {
         let engine = AudioEngine::default();
-        engine.play("/nonexistent/file.mp3", "title", 100.0);
+        engine.play("/nonexistent/file.mp3", "title", "artist", 100.0);
         engine.set_volume(80);
         engine.seek_to(5.0);
         engine.seek_relative(10.0);

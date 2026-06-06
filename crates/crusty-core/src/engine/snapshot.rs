@@ -21,6 +21,8 @@ pub struct PlayerSnapshot {
     pub volume: u32,
     /// Title of the currently loaded track (empty when none).
     pub title: String,
+    /// Artist/uploader of the currently loaded track (empty when none).
+    pub artist: String,
 }
 
 impl Default for PlayerSnapshot {
@@ -31,6 +33,7 @@ impl Default for PlayerSnapshot {
             duration_secs: 0.0,
             volume: 100,
             title: String::new(),
+            artist: String::new(),
         }
     }
 }

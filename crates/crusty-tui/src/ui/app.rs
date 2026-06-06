@@ -84,6 +84,13 @@ pub struct MusicPlayerApp {
     // Playback state
     pub(super) pending_play_track: Option<Track>,
     pub(super) currently_downloading: Option<String>,
+
+    // MPRIS control surface (Waybar / Quickshell / playerctl). The sender is
+    // handed to the spawned MPRIS server; actions are drained in the run loop.
+    #[cfg(feature = "mpris")]
+    mpris_action_tx: mpsc::UnboundedSender<crusty_core::mpris::MprisAction>,
+    #[cfg(feature = "mpris")]
+    mpris_action_rx: mpsc::UnboundedReceiver<crusty_core::mpris::MprisAction>,
 }
 
 impl MusicPlayerApp {
@@ -134,6 +141,9 @@ impl MusicPlayerApp {
         let engine = AudioEngine::new();
         let engine_events = engine.subscribe_events();
 
+        #[cfg(feature = "mpris")]
+        let (mpris_action_tx, mpris_action_rx) = mpsc::unbounded_channel();
+
         Ok(MusicPlayerApp {
             engine,
             engine_events,
@@ -165,7 +175,25 @@ impl MusicPlayerApp {
             feed_tx,
             pending_play_track: None,
             currently_downloading: None,
+            #[cfg(feature = "mpris")]
+            mpris_action_tx,
+            #[cfg(feature = "mpris")]
+            mpris_action_rx,
         })
+    }
+
+    /// Spawn the MPRIS server task. Failures (e.g. no session bus) are logged and
+    /// swallowed so the TUI runs unaffected.
+    #[cfg(feature = "mpris")]
+    fn spawn_mpris(&self) {
+        let controller = self.engine.controller();
+        let actions = self.mpris_action_tx.clone();
+        tokio::spawn(async move {
+            // can_raise = false: a TUI cannot raise a window.
+            if let Err(e) = crusty_core::mpris::serve_mpris(controller, actions, false).await {
+                tracing::warn!("MPRIS unavailable (no session bus?): {e}");
+            }
+        });
     }
 
     /// Set a status message and record when it was set for auto-clear.
@@ -290,6 +318,10 @@ impl MusicPlayerApp {
         // Clean up old pre-downloaded files on startup
         DownloadManager::cleanup_old_downloads();
 
+        // Start the MPRIS control surface (Waybar / Quickshell / playerctl).
+        #[cfg(feature = "mpris")]
+        self.spawn_mpris();
+
         // Trigger async queue load on first iteration
         let mut queue_load_triggered = false;
 
@@ -398,6 +430,7 @@ impl MusicPlayerApp {
                                 self.engine.play(
                                     temp_file_path.clone(),
                                     track.title.clone(),
+                                    track.uploader.clone(),
                                     track.duration as f64,
                                 );
                                 self.status_message.clear();
@@ -493,6 +526,24 @@ impl MusicPlayerApp {
                 } else {
                     self.engine.stop();
                     self.status_message = "Playback finished - queue is empty".to_string();
+                }
+            }
+
+            // Drain MPRIS actions (Waybar / Quickshell / playerctl). Each maps to
+            // the SAME method a keybinding uses, so external control == keyboard.
+            #[cfg(feature = "mpris")]
+            {
+                use crusty_core::mpris::MprisAction;
+                while let Ok(action) = self.mpris_action_rx.try_recv() {
+                    match action {
+                        MprisAction::PlayPause | MprisAction::Play => {
+                            self.toggle_pause_or_start().await;
+                        }
+                        MprisAction::Next => self.play_next().await,
+                        MprisAction::Previous => self.play_previous().await,
+                        MprisAction::Stop => self.engine.stop(),
+                        MprisAction::Quit => self.should_quit = true,
+                    }
                 }
             }
 

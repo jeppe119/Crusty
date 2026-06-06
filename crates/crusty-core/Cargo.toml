@@ -18,4 +18,13 @@ rodio = "0.22"
 # Lock-free command channel: Sender is Send + Sync, recv_timeout drives the loop
 crossbeam-channel = "0.5"
 
+# MPRIS2 D-Bus media-player interface (optional, `mpris` feature).
+# Serves Waybar, Quickshell (Quickshell.Services.Mpris), and playerctl.
+mpris-server = { version = "0.9", optional = true }
+
+[features]
+# Off by default to keep core lean / portable; enabled by crusty-tui (default-on
+# there) and the future GUI. The bridge degrades gracefully if no session bus.
+mpris = ["dep:mpris-server"]
+
 [dev-dependencies]

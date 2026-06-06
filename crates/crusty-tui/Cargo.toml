@@ -45,4 +45,10 @@ tempfile = "3.10"
 # Shared framework-agnostic core (audio engine, queue, downloads, config/state)
 crusty-core = { path = "../crusty-core" }
 
+[features]
+default = ["mpris"]
+# MPRIS2 D-Bus control surface (Waybar / Quickshell / playerctl). On by default;
+# build with --no-default-features for headless/non-Linux without D-Bus.
+mpris = ["crusty-core/mpris"]
+
 [dev-dependencies]

@@ -47,8 +47,12 @@ impl MusicPlayerApp {
 
         if let Some(local_file) = cached_file {
             if std::path::Path::new(&local_file).exists() {
-                self.engine
-                    .play(local_file, track.title.clone(), track.duration as f64);
+                self.engine.play(
+                    local_file,
+                    track.title.clone(),
+                    track.uploader.clone(),
+                    track.duration as f64,
+                );
                 self.status_message.clear();
                 let next = self.queue.get_queue_slice(0, LOOKAHEAD_DOWNLOAD_COUNT);
                 self.downloads
@@ -217,9 +221,10 @@ impl MusicPlayerApp {
             return;
         }
 
-        // Play the track from cache
+        // Play the track from cache. PlaybackState does not persist the artist,
+        // so it's empty on resume until the next track change refreshes it.
         self.engine
-            .play(file_path, saved.title.clone(), saved.duration);
+            .play(file_path, saved.title.clone(), String::new(), saved.duration);
 
         // Seek to the saved position
         if saved.position_secs > 1.0 {

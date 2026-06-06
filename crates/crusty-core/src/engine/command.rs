@@ -20,6 +20,8 @@ pub enum AudioCommand {
         path: PathBuf,
         /// Display title for the now-playing snapshot.
         title: String,
+        /// Artist/uploader for the now-playing snapshot (may be empty).
+        artist: String,
         /// Known duration in seconds (`<= 0.0` means "unknown").
         duration_secs: f64,
     },
