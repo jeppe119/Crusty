@@ -14,8 +14,12 @@
 //! Modules are populated incrementally per `CRUSTY_CORE_EXTRACTION_PLAN.md`.
 
 pub mod config;
+pub mod download;
 pub mod model;
+pub mod persistence;
 pub mod queue;
 
-pub use model::{PlayerState, Track};
+pub use download::{DownloadManager, DownloadResult};
+pub use model::{PersistedQueue, PlayerState, Track};
+pub use persistence::{PersistenceService, PlaybackState};
 pub use queue::Queue;

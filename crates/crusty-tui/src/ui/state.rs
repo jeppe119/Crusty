@@ -157,11 +157,10 @@ pub(crate) struct FeedState {
 }
 
 /// Serializable snapshot of the queue for persistence.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct QueueState {
-    pub tracks: Vec<Track>,
-    pub current_track: Option<Track>,
-}
+///
+/// The DTO now lives in `crusty_core::model::PersistedQueue`; re-exported here
+/// under its historical name so `crate::ui::state::QueueState` keeps working.
+pub(crate) use crusty_core::PersistedQueue as QueueState;
 
 /// UI selection indices, expansion toggles, and animation state.
 #[derive(Debug)]

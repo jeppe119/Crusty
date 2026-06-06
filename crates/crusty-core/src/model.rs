@@ -57,3 +57,12 @@ impl Track {
         }
     }
 }
+
+/// Serializable snapshot of the playback queue for persistence.
+///
+/// This is the on-disk shape of `queue.json`. **Do not rename fields.**
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PersistedQueue {
+    pub tracks: Vec<Track>,
+    pub current_track: Option<Track>,
+}
