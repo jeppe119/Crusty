@@ -12,3 +12,8 @@
 //! This crate must never depend on `ratatui`/`crossterm` (TUI) or `tauri` (GUI).
 //!
 //! Modules are populated incrementally per `CRUSTY_CORE_EXTRACTION_PLAN.md`.
+
+pub mod config;
+pub mod model;
+
+pub use model::{PlayerState, Track};

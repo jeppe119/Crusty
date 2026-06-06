@@ -14,27 +14,9 @@
 use rodio::{Decoder, DeviceSinkBuilder, Player};
 use std::time::{Duration, Instant};
 
-// ==========================================
-// PLAYER STATE ENUM
-// ==========================================
-// This enum represents the three possible states of the audio player.
-//
-// Why use an enum instead of multiple booleans?
-// - Clearer: Can't be both Playing AND Stopped at the same time
-// - Type-safe: Rust ensures you handle all cases
-// - Memory efficient: Only stores one value
-//
-// Derives:
-// - Debug: Can print the state for debugging (e.g., println!("{:?}", state))
-// - Clone: Can make copies of the state
-// - PartialEq: Can compare states (e.g., if state == PlayerState::Playing)
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PlayerState {
-    Stopped, // No audio loaded or playback has been stopped
-    Playing, // Audio is currently playing
-    Paused,  // Audio is loaded but temporarily paused
-    Loading, // Audio is being loaded/decoded (transitional state)
-}
+// `PlayerState` now lives in `crusty-core`. Re-exported here so existing
+// `crate::player::audio::PlayerState` import paths keep working.
+pub use crusty_core::PlayerState;
 
 // ==========================================
 // AUDIO PLAYER STRUCT
