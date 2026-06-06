@@ -15,5 +15,7 @@
 
 pub mod config;
 pub mod model;
+pub mod queue;
 
 pub use model::{PlayerState, Track};
+pub use queue::Queue;
